@@ -1,6 +1,6 @@
 /* LocalSight design tokens — single source of truth for the visual system.
  *
- * Wave-0 scope (docs/reviews/UI_UX_AUDIT_AND_REDESIGN_PLAN.md §III.1):
+ * Design-system scope:
  * - contrast-corrected semantic colors (all measured pairs ≥ 4.5:1 where text)
  * - one 4px spacing grid, 2-step radius scale, 1.2 type scale
  * - 44px minimum hit targets and visible :focus-visible rings (WCAG 2.2)

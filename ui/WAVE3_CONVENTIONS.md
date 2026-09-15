@@ -1,8 +1,8 @@
 # UI Wave-3 conventions brief (for parallel view modules)
 
 Every view module in this wave MUST follow these rules — they come from
-`AGENTS.md` (CSP, XSS, sessions), `docs/reviews/UI_UX_AUDIT_AND_REDESIGN_PLAN.md`
-(design system), and Waves 0–2 (established patterns).
+`AGENTS.md` (CSP, XSS, sessions), the design tokens in `ui/tokens.css`
+(the visual system), and established patterns in the existing views.
 
 ## Hard constraints (violations = rewrite)
 

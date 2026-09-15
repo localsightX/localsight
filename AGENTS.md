@@ -18,16 +18,26 @@ apps/worker/     per-camera AI pipelines, recorder, retention, alert fan-out
 packages/domain/ ORM models, schemas, timeutil, events
 packages/security/ passwords, JWT, RBAC, crypto (envelope), SSRF, rate-limit, MFA, audit
 packages/ai/     detector/tracker/face/matcher interfaces + reference impls + pipeline
-                 detectors.py (ONNX/TensorRT/OpenVINO/TFLite), rules.py, anpr.py, vlm.py
+                 detectors.py (ONNX/TensorRT/OpenVINO/TFLite + COCO→platform label
+                 map), face_onnx.py (staged SCRFD detector + ArcFace embedder),
+                 registry.py (SHA-256 model staging), rules.py, anpr.py, vlm.py
 packages/video/  frame sources, safe FFmpeg argv builder, stream gateway,
-                 onvif, presets, recorder
+                 onvif, presets, tplink.py (VIGI/Tapo URL builders), recorder
 packages/storage/ StorageProvider ABC + local + S3 implementations, signed URLs
 packages/notify/ webhook/email/push/MQTT alert channels + routing
 packages/observability/ metrics registry + structured logging
-ui/              vanilla-JS dashboard (served at /)
+ui/              vanilla-JS dashboard (served at /): views/ (dashboard, live +
+                 dvr_scrubber, events, timeline, cameras + mask/rules editors +
+                 wizard, analytics, people, alerts admin, users, audit, privacy,
+                 account, login) and core/ (dom, api, router, palette, density,
+                 shortcuts, telemetry, toast, states, format)
+models/          registry.json (name/path/SHA-256/source/license) + staged/
+                 (yolo11n-detect.onnx, faces/det_500m.onnx, faces/w600k_mbf.onnx)
 infrastructure/  Dockerfile, compose stack, nginx, monitoring
 docs/            architecture, security, operations, integrations, api, reviews
-scripts/         gen_env.py, capacity.py, seed_dev_data.py, ui_audit*.py (Playwright)
+scripts/         gen_env.py, capacity.py, seed_dev_data.py, local_cctv_rig.py,
+                 ui_audit.py / ui_design_metrics.py / ui_maturity_scan.py /
+                 ui_probe_flows.py / ui_probe_wave1..4.py (Playwright)
 tests/           unit + security + API + integration; tests/ui = Playwright e2e
 ```
 
@@ -69,9 +79,14 @@ tests/           unit + security + API + integration; tests/ui = Playwright e2e
 
 4. **Subprocess safety**: FFmpeg/ffprobe are invoked with argv lists built
    in-code (`packages/video/ffmpeg.py`), never `shell=True`, and every
-   operator-supplied URL passes `validate_egress_url` first. Always
-   `terminate()` **and** `wait()` — an unreaped child is a zombie (see
-   `sources.py`, `recorder.py`).
+   operator-supplied URL passes `validate_egress_url` first. Two load-bearing
+   details from the RTSP end-to-end fix: `build_args` **re-validates with the
+   deploy-time allowlist** (defense in depth — validating without it made a
+   private-network camera fail inside ffmpeg and the worker thread die silently
+   after its reconnect budget), and the decoder's stderr goes to `DEVNULL` (a
+   chatty ffmpeg on an undrained 64 KB pipe deadlocks mid-encode). Default
+   transport is `-rtsp_transport tcp`. Always `terminate()` **and** `wait()` —
+   an unreaped child is a zombie (see `sources.py`, `recorder.py`).
 
 5. **Storage streaming**: large media moves through `put_stream` — never read
    a recording into the heap. A 4 Mbps 300 s segment is ~150 MB; high-bitrate
@@ -93,19 +108,64 @@ tests/           unit + security + API + integration; tests/ui = Playwright e2e
    child tables of existing entities get `ondelete=` on the FK plus storage
    cleanup where media objects are involved (see `delete_camera`).
 
+9. **Models are supply-chain artifacts**: weights are staged by an operator
+   into `models/staged/` and declared (name, version, path, SHA-256, source,
+   license) in `models/registry.json`. `ModelRegistry.verify` refuses a hash
+   mismatch and **nothing is ever fetched from a URL at runtime**. Model-backed
+   backends fail closed (`build_detector` raises, per `make_detector`); an
+   *optional* capability (the face chain) logs a downgrade to the reference
+   implementation instead of killing the worker. Staged COCO detectors are
+   wrapped by `_LabelMappedDetector` so rules/tracks/alerts/analytics only ever
+   see the platform vocabulary (`person`/`vehicle`/`bicycle`/`motorcycle`/`bus`/
+   `truck`/`animal`/`bag`/`package`) — COCO-only classes are dropped.
+   Enroll and recognize must use the *same* embedder model version: vectors are
+   only compared within a version, so mixing them silently never matches.
+
+10. **Playback is signed-URL only, from the archive**: the live-view DVR
+    (`ui/views/dvr_scrubber.js`) resolves a wall-clock moment through
+    `GET /api/cameras/{id}/recordings` and `/recordings/at` (both `video:view`,
+    both issuing short-lived signed URLs) and swaps the `<video>` src to the
+    recorded segment — it never touches the RTSP URL, and `VideoSegment` rows
+    are only listed once their file actually landed (`size_bytes > 0`), so a
+    scrub can never land in a hole that 404s.
+
 ## Key runtime facts
 
 - **Dev**: SQLite, tests run against an in-memory-ish session-scoped app
   (`conftest.py`); `.venv` at repo root; `pytest tests/ -q` must pass
-  (currently 97 tests). The UI e2e suite is separate: `pytest tests/ui -m ui`
-  boots a real uvicorn server + seeded throwaway DB and drives it with
-  Playwright (needs `playwright`, `pytest-playwright`, chromium, ffmpeg);
-  `pytest tests/` never collects it (deselected via the `ui` marker,
-  pytest.ini).
+  (**currently 111 tests**, up from 97 — `test_surveillance.py` carries 64 of
+  them). The UI e2e suite is separate: `pytest tests/ui -m ui` collects 43
+  more (154 total) — it boots a real uvicorn server + seeded throwaway DB and
+  drives it with Playwright (needs `playwright`, `pytest-playwright`,
+  chromium, ffmpeg); `pytest tests/` never collects it (deselected via the `ui`
+  marker, pytest.ini).
 - **Dev-parity FK enforcement**: `bootstrap.build` enables
   `PRAGMA foreign_keys=ON` on SQLite so cascade/integrity behavior matches
   PostgreSQL. Never remove this — it's what keeps dev bugs from hiding until
   production.
+- **Local CCTV rig** (`scripts/local_cctv_rig.py`, dev-only, stdlib-only):
+  turns a MacBook into a one-camera NVR site — FaceTime (or `--source
+  synthetic`) → ffmpeg → local `mediamtx` RTSP broker (loopback) → the real
+  API + worker. `setup` / `start` / `status` / `verify` / `watch` / `stop`,
+  process-managed via PID files under `.rig/` (gitignored). It exports
+  `SSRF_ALLOWLIST=127.0.0.0/8` (loopback broker — required for LocalSight to
+  dial it), 30 s `RECORD_SEGMENT_SECONDS` for fast evidence, and its own dev
+  secrets. Camera URLs use the `127.0.0.1` IP literal, never `localhost`
+  (the SSRF allowlist matches hostnames against CIDRs). `verify` is a
+  ~15-check end-to-end probe (stream → recording → events → live) — the
+  fastest real-feedback loop for anything touching video/AI.
+- **Model staging**: `models/registry.json` currently declares three staged,
+  hash-verified artifacts — `detector` (YOLO11n, COCO), `face_detector`
+  (SCRFD 500M), `face_embedder` (ArcFace MobileFaceNet w600k). All from
+  public upstreams with their licenses recorded. Point `AI_DETECTOR` at `onnx`
+  (and install `onnxruntime`) to use them; the rig env does this by default.
+  See `docs/operations/onnx-detector.md` for the operator staging procedure.
+- **Camera liveness is written by the worker**: `persist_camera_status` maps
+  gateway transitions onto `Camera.status`/`health`/`last_seen`
+  (`ONLINE→streaming`, `RECONNECTING→unstable`, `OFFLINE→unreachable`), and a
+  bounded ≤1-per-30 s heartbeat touches `last_seen` while frames flow. Before
+  this, nothing wrote those columns after creation, so every camera read
+  OFFLINE forever even while streaming.
 - **Prod (compose)**: PostgreSQL + pgvector, `DATABASE_URL=postgresql+psycopg://`
   (driver installed via `requirements-prod.txt`), nginx TLS frontend.
 - **Schema evolution**: `Base.metadata.create_all` + `bootstrap._ensure_columns`
@@ -119,6 +179,12 @@ tests/           unit + security + API + integration; tests/ui = Playwright e2e
 - **Live view**: transcodes are tracked in `_live_streams` with idle/max-age
   reaping; `LOCALSIGHT_LIVE_DIR` sets the shared root for both the ffmpeg
   output and the `/live-media` mount (single source: `apps/api/domain_live_cfg.py`).
+  Each live tile also carries the **DVR scrubber** (1 h window, SVG track,
+  signed-URL segment swaps) and the event drawer links a clip assembled from
+  the same segments (`GET /api/events/{id}/clip`).
+- **Rebrand back-compat**: LocalSight was LocalVision. `domain_live_cfg._env`
+  honors the legacy `LOCALVISION_*` names when the `LOCALSIGHT_*` name is
+  unset (new name wins), so an upgrade never silently resets live config.
 
 ## Authentication & authorization quick reference
 
@@ -127,6 +193,16 @@ tests/           unit + security + API + integration; tests/ui = Playwright e2e
 - Login always performs exactly ONE Argon2 verify (fixed `_DUMMY_HASH` for
   nonexistent accounts) — do not "optimize" this into a branch skip; it's the
   user-enumeration defense.
+- Account lifecycle endpoints (all backing the Account view, wave M2):
+  `POST /api/auth/password` (rotates, revokes other sessions),
+  `GET /api/auth/sessions` + `POST /api/auth/sessions/{token_id}/revoke`,
+  `POST /api/auth/mfa/setup` + `/mfa/verify`. Every one is audited and
+  rate-limited (`login` 1/s burst 10, `refresh` 2/s burst 20, `password`
+  0.2/s burst 5).
+- Admin-side (`user:manage`): `GET /api/users/{id}/sessions`,
+  `POST /api/users/{id}/sessions/revoke-all`, `POST /api/users/{id}/mfa-reset`
+  (the latter two are typed-confirm in the Users view); users can never revoke
+  another user's sessions. Deleting a user is typed-email confirm.
 - RBAC: roles → permissions (`packages/security/rbac.py`); endpoints declare
   `require_permission("...")`. Permission names live in the RBAC tables.
 - Rate limiting: in-process token bucket keyed by client IP; `X-Forwarded-For`
@@ -134,17 +210,26 @@ tests/           unit + security + API + integration; tests/ui = Playwright e2e
 
 ## Quality gates
 
-- `pytest tests/ -q` — all green (90+).
-- `pytest tests/ui -m ui` — the browser suite (Wave 5); run it before
-  merging UI changes (needs chromium via `playwright install`, ffmpeg).
+- `pytest tests/ -q` — all green (**111 passed**, 43 deselected) in ~45 s.
+- `pytest tests/ui -m ui` — the browser suite (Wave 5 + maturity waves); run it
+  before merging UI changes (needs chromium via `playwright install`, ffmpeg).
+  43 tests: journeys (12), a11y/axe, CSP console, design tokens, flows,
+  perf budgets, 12-state visual regression.
 - `ruff check .` — `ruff.toml` defines the rule set; keep changed files clean,
   don't mass-reformat untouched files.
 - `mypy packages apps --ignore-missing-imports` — keep new code typed
   (`Mapped[]`, `| None` unions).
-- CI (`.github/workflows/ci.yml`): lint, unit, PostgreSQL integration, dep
-  audits, CodeQL + Semgrep SAST, Trivy container scan, and the
-  merge-blocking `ui-e2e` job (journeys, a11y/axe, CSP console gate,
-  visual regression, perf budgets).
+- `python scripts/local_cctv_rig.py verify` — end-to-end video/recording/AI/live
+  probe on a real box (the only gate that exercises ffmpeg + RTSP + storage
+  together); use it for anything on the video path.
+- `python scripts/ui_maturity_scan.py` — read-only 19-state scan; each M-wave
+  adds assertions so the gaps it found can't return.
+- CI (`.github/workflows/ci.yml`, 10 jobs): `lint`, `test` (unit, SQLite),
+  `integration` (PostgreSQL), `security-deps` (pip-audit + Safety),
+  `sast-codeql`, `sast-semgrep`, `container-scan` (Trivy), `docker` (build/push
+  on main), the merge-blocking `ui-e2e` job (journeys, a11y/axe, CSP console
+  gate, visual regression, perf budgets), and `quality-gate` which needs all of
+  them green.
 
 ## Workflow for any change
 
@@ -155,18 +240,52 @@ tests/           unit + security + API + integration; tests/ui = Playwright e2e
    suite missed real production defects because paths were unexercised —
    regression tests for any fix are mandatory (see the F-01 tests).
 4. Run the full suite; check `git status` for accidental artifacts (dbs,
-   coverage files — now gitignored).
-5. Update docs for user-visible changes: README capabilities, `docs/api/`
-   when endpoints change, `docs/operations/runbook.md` for ops procedures.
-6. Conventional Commits (`fix:`, `feat:`, `security:`, `perf:`, `docs:`, ...).
+   coverage files, `ui_e2e_artifacts_*/`, `ui_maturity/` — all gitignored).
+5. Update docs for user-visible changes: README capabilities, `docs/api/` when
+   endpoints change, `docs/operations/runbook.md` for ops procedures, and
+   `docs/USER_GUIDE.md` (with a real screenshot) for operator-facing changes.
+   Anything touching the video/AI path also updates
+   `docs/operations/onnx-detector.md` or `docs/integrations/` as applicable.
+6. UI changes: run the matching wave probe (`scripts/ui_probe_wave*.py`) plus
+   the maturity scan assertions for the view you touched — a redesign gate you
+   eyeballed is a gate that regresses.
+7. Conventional Commits (`fix:`, `feat:`, `security:`, `perf:`, `docs:`, ...).
 
-## Known reference implementations (intentional placeholders)
+## AI backends: real vs. reference (know which one you're looking at)
 
-Detection (`ReferenceMotionDetector`), ANPR OCR, embeddings (`ReferenceEmbedder`),
-and VLM search are deterministic placeholders — functional but not
-production-accurate. Real backends arrive via the `ModelRegistry`
-(`models/registry.json`, SHA-256-verified). Do NOT "fix" reference
-implementations to be smarter; swap them via the interfaces.
+The interfaces are the contract; implementations are swapped, never "improved".
+
+**Real, staged, hash-verified (in-tree today):**
+
+- **Object detection** — `ONNXDetector` running
+  `models/staged/yolo11n-detect.onnx` (Ultralytics YOLO11n, COCO-pretrained) via
+  lazy `onnxruntime` (CUDA auto-detected; CoreML on Apple Silicon). Enable with
+  `AI_DETECTOR=onnx` + `AI_MODEL_NAME=detector`. Both ultralytics export layouts
+  are supported (row-major and the transposed v8/v11 head) and COCO labels are
+  remapped into the platform vocabulary by `_LabelMappedDetector`. The local
+  CCTV rig runs this by default.
+- **Identity recognition** — `packages/ai/face_onnx.py`: SCRFD 500M face
+  detector + ArcFace MobileFaceNet embedder (`build_face_chain`: 5-point
+  landmark alignment, 112×112, 512-d L2-normalized vectors, cosine band ~0.4–0.5),
+  gated behind `AI_IDENTITY_RECOGNITION_ENABLED` (default **false** — biometric;
+  lawful basis required). `bootstrap.build` loads the staged chain for
+  *enrollment* regardless of the flag, so enroll→recognize vectors are
+  comparable even when recognition is switched on later (vectors only compare
+  within a model version — mixing embedders silently never matches).
+
+**Reference placeholders (deterministic, not production-accurate):**
+
+- `ReferenceMotionDetector` — CPU frame-differencing that emits `person` only;
+  the default `AI_DETECTOR` and the no-model fallback.
+- `ReferenceFaceDetector` / `ReferenceEmbedder` — a deterministic image-hash
+  embedding used when staged face models are absent (the worker logs a
+  downgrade rather than failing).
+- ANPR OCR (`anpr.py`), VLM/CLIP semantic search (`vlm.py`), and appearance
+  ReID (tracking is SORT-style motion prediction only).
+
+Do NOT "fix" a reference implementation to be smarter — stage a model and swap
+it via the interfaces (rule 9). `docs/operations/onnx-detector.md` documents the
+operator staging procedure and the backend table.
 
 ## Where the bodies are buried
 
@@ -175,39 +294,43 @@ evidence, impact, and fix rationale for every recent change (F-01 … F-14,
 D-1 … D-7, M-1 … M-38). Read it before large refactors; it explains why the
 code looks the way it does now.
 
-`docs/reviews/UI_UX_AUDIT_AND_REDESIGN_PLAN.md` is the UI/UX counterpart:
-a Playwright-measured audit (findings C-1 … C-14) and the phased enterprise
-redesign. Waves 0 (trust repairs), 1 (investigation loop), 2 (Monitor:
-live grid + wall mode, auto-refreshing overview), 3 (Manage: camera
-grid + detail tabs, mask/rules editors, add-camera wizard, identities,
-alerts admin, users, privacy dashboard), and 4 (Analytics & polish:
-analytics view with CSP-safe SVG/canvas charts, natural-language search,
-keyboard map with `?` overlay, density toggle, WCAG 2.1 AA conformance —
-axe-core scans EVERY view, including login, ZERO violations required)
-and 5 (hardening: the audit as permanent CI gates) are DONE — the redesign
-is complete. Wave 5 converted the audit into `tests/ui/` (real-browser
-pytest suite: journeys, per-view axe-core scans, zero-console-errors
-under the live CSP, token/design assertions, refresh-on-401/empty/
-error/double-submit flows, 12-state visual regression against committed
-baselines in `ui_audit/baselines/` with `UPDATE_BASELINES=1` to
-regenerate, and perf budgets — TTI < 3s, JS < 300KB, view latency
-< 2.5s). CI's `ui-e2e` job runs it on every PR and it is merge-blocking
-via the quality gate. The suite caught its first defect during its own
-build (a `<dt>/<dd>` outside a `<dl>`) — the gate works. Opt-in UI
-marks: `ui/core/telemetry.js` (local ring buffer, default OFF, Privacy
-view toggle, JSON download — nothing leaves the browser tab).
-Each wave ALSO ships its own Playwright probe:
-`scripts/ui_probe_flows.py` (W0), `ui_probe_wave1.py`, `ui_probe_wave2.py`,
-`ui_probe_wave3.py`, `ui_probe_wave4.py` — run the matching probe for any
-view you touch; they are self-provisioning (create their own throwaway
-users) and assert the audit findings stay fixed. The Wave-4 probe embeds
-the axe gate: `scripts/vendor/axe.min.js` is a PROBE-ONLY asset (never
-served, never shipped — the app's one vendor dependency remains hls.js);
-keep new views clean by running the probe, not by eyeballing contrast.
-Frontend conventions for new views live in
+The UI/UX layer has its own regression contract in `tests/ui/` (real-browser
+pytest suite: journeys, per-view axe-core scans, zero-console-errors under the
+live CSP, token/design assertions, refresh-on-401/empty/error/double-submit
+flows, 12-state visual regression against committed baselines in
+`ui_audit/baselines/` with `UPDATE_BASELINES=1` to regenerate, and perf budgets
+— TTI < 3s, JS < 300KB, view latency < 2.5s). CI's `ui-e2e` job runs it on
+every PR and it is merge-blocking via the quality gate. The suite caught its
+first defect during its own build (a `<dt>/<dd>` outside a `<dl>`) — the gate
+works. Opt-in UI marks: `ui/core/telemetry.js` (local ring buffer, default OFF,
+Privacy view toggle, JSON download — nothing leaves the browser tab).
+
+Per-view Playwright probes reproduce any finding and assert the fixed ones stay
+fixed: `scripts/ui_probe_flows.py`, `ui_probe_wave1.py`, `ui_probe_wave2.py`,
+`ui_probe_wave3.py`, `ui_probe_wave4.py` — run the matching probe for any view
+you touch; they are self-provisioning (create their own throwaway users). The
+Wave-4 probe embeds the axe gate: `scripts/vendor/axe.min.js` is a PROBE-ONLY
+asset (never served, never shipped — the app's one vendor dependency remains
+hls.js); keep new views clean by running the probe, not by eyeballing contrast.
+The audit scripts reproduce any finding: `scripts/ui_audit.py`,
+`scripts/ui_design_metrics.py`, `scripts/ui_probe_flows.py`.
+
+`scripts/ui_maturity_scan.py` is the read-only 19-state console scan
+(screenshots + computed-style telemetry into `ui_maturity/`, gitignored) and
+doubles as a gate: it asserts the data-surface and density affordances that
+matter operationally — sortable-table headers, bulk-selection boxes, CSV
+export, the single `#toast` aria-live host, "Copy link" filters, the Ctrl-K
+command palette (`ui/core/palette.js`), and drawer labelling
+(`bulk_boxes`/`toast_host`/`copy_link`/`palette_wired`/`drawer_labelled`), so
+regressions can't return. Frontend conventions for new views live in
 `ui/WAVE3_CONVENTIONS.md` (CSP-safe SVG geometry, h()/render() DOM
-construction, RBAC gating, honest empty/error states, write-only
-credentials, typed-confirm deletes). The
-audit scripts reproduce any finding: `scripts/ui_audit.py`,
-`scripts/ui_design_metrics.py`, `scripts/ui_probe_flows.py` (see the report's
-Appendix B).
+construction, RBAC gating, honest empty/error states, write-only credentials,
+typed-confirm deletes).
+
+**Supporting docs:** `docs/USER_GUIDE.md` is the operator-facing manual
+(every section shows a real screenshot from `docs/img/`); the engineering-agent
+orientation is this file; `docs/operations/onnx-detector.md` stages a detector;
+`docs/operations/runbook.md` and `docs/operations/ci-cd-pipeline.md` cover ops
+and the 10-job pipeline; `docs/integrations/tplink-vigi.md` covers TP-Link
+VIGI/Tapo/NVR; `docs/security/SECURITY.md` and `docs/architecture/*` (system,
+ERD, ADRs, threat model) round out the design record.

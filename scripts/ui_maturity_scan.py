@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 # ruff: noqa: E501  (metrics JS template is one long literal by design)
-"""UI maturity scan (Turn 12) — the instrumented sweep behind the
-enterprise-maturity plan (docs/reviews/UI_UX_ENTERPRISE_MATURITY_PLAN.md).
+"""UI maturity scan — the instrumented sweep over the console's screen states.
 
 For every screen state it captures:
   - a screenshot (ui_maturity/shots/)

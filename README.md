@@ -307,7 +307,7 @@ ui/               static dashboard (served at /)
 tests/            unit + security + integration (74 tests)
 ```
 
-## Status vs. plan
+## Status
 
 Implemented and tested: auth (Argon2id, JWT rotation, MFA, lockout), RBAC, envelope
 encryption, immutable audit log, SSRF egress guard (camera + webhook + ONVIF), signed
@@ -329,5 +329,4 @@ See `docs/` for architecture decision records, threat model, ERD, security contr
 the operations runbook. Operator-facing usage documentation is in
 `docs/USER_GUIDE.md`; engineering-agent orientation (invariants, workflow)
 is in `AGENTS.md`; the full architectural review with evidence and fix
-rationale is in `docs/reviews/CODE_ANALYSIS_REPORT.md`. Market positioning
-and the phased roadmap are in `docs/PRODUCT_STRATEGY_2026.md`.
+rationale is in `docs/reviews/CODE_ANALYSIS_REPORT.md`.

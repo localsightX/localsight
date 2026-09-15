@@ -141,7 +141,7 @@ When adding or changing a feature, update:
 2. **docs/api/openapi-summary.md** — new endpoints with use-case examples
 3. **docs/architecture/system-architecture.md** — data flow or component changes
 4. **docs/operations/runbook.md** — operational procedures
-5. **docs/PRODUCT_STRATEGY_2026.md** — roadmap if scope changes
+5. **docs/USER_GUIDE.md** — operator-facing usage (with a real screenshot)
 
 ## Filing Issues
 
