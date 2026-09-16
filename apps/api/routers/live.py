@@ -162,6 +162,16 @@ def _stop_stream(camera_id: str) -> bool:
     return True
 
 
+def stop_camera_stream(camera_id: str) -> bool:
+    """Public stop entry point: tear down a camera's live transcode, if any.
+
+    Camera deletion (cameras router) uses this so removing a camera also stops
+    its ffmpeg instead of leaving it writing under an id that no longer exists.
+    Returns True when a transcode was actually stopped.
+    """
+    return _stop_stream(camera_id)
+
+
 def shutdown_live_streams() -> None:
     """Stop every transcode (called on app shutdown so ffmpeg doesn't orphan)."""
     with _live_lock:

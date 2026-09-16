@@ -5,6 +5,7 @@ outcome — not DOM internals. These encode the redesign's exit criteria:
 shareable investigations, honest live states, and management flows that
 expose every backend capability.
 """
+import httpx
 import pytest
 
 pytestmark = pytest.mark.ui
@@ -139,3 +140,49 @@ class TestSessionJourney:
         logged_in.wait_for_selector("#login:not(.hidden)")
         assert logged_in.evaluate(
             "!document.getElementById('app').classList.contains('hidden')") is False
+
+
+class TestCameraRemovalJourney:
+    def test_remove_camera_typed_confirm(self, server, logged_in, admin_token):
+        """Removing a camera is a typed-confirm gate; the grid then loses the card."""
+        page = logged_in
+        r = httpx.post(f"{server['base']}/api/cameras",
+                       json={"name": "e2e-remove-me"},
+                       headers={"Authorization": f"Bearer {admin_token}"}, timeout=10)
+        assert r.status_code == 200, r.text
+        cam_id = r.json()["id"]
+
+        page.goto(f"{server['base']}/#/cameras?id={cam_id}")
+        page.wait_for_selector("[data-role=remove-camera]")
+        # The destructive control is not even revealed until asked for…
+        page.click("[data-act=remove-camera]")
+        page.wait_for_selector("[data-role=remove-confirm]:not(.hidden)")
+        # …and it stays locked until the camera's exact name is typed.
+        assert page.is_disabled("[data-act=remove-camera-confirm]")
+        page.fill("[data-field=confirm-name]", "e2e-remove")
+        assert page.is_disabled("[data-act=remove-camera-confirm]")
+        page.fill("[data-field=confirm-name]", "e2e-remove-me")
+        page.wait_for_selector("[data-act=remove-camera-confirm]:not([disabled])")
+        page.click("[data-act=remove-camera-confirm]")
+        page.wait_for_selector(".cam-grid")
+        assert page.locator(".cam-card[data-cam='e2e-remove-me']").count() == 0
+
+    def test_remove_camera_cancel_keeps_it(self, server, logged_in, admin_token):
+        """Cancel backs out without any API call — the camera survives."""
+        page = logged_in
+        r = httpx.post(f"{server['base']}/api/cameras",
+                       json={"name": "e2e-keep-me"},
+                       headers={"Authorization": f"Bearer {admin_token}"}, timeout=10)
+        assert r.status_code == 200, r.text
+        cam_id = r.json()["id"]
+
+        page.goto(f"{server['base']}/#/cameras?id={cam_id}")
+        page.wait_for_selector("[data-role=remove-camera]")
+        page.click("[data-act=remove-camera]")
+        page.wait_for_selector("[data-role=remove-confirm]:not(.hidden)")
+        page.click("[data-act=remove-camera-cancel]")
+        # 'hidden' means display:none — wait for attachment, not visibility.
+        page.wait_for_selector("[data-role=remove-confirm].hidden", state="attached")
+        page.click("#nav button[data-view='cameras']")
+        page.wait_for_selector(".cam-grid")
+        assert page.locator(".cam-card[data-cam='e2e-keep-me']").count() == 1

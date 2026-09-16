@@ -23,7 +23,7 @@ Base path `/api`. All responses are JSON. All mutating/protected endpoints requi
 | POST | `/api/cameras/presets/build` | `camera:configure` (construct vendor RTSP URL; credentials never echoed) |
 | POST | `/api/cameras/onvif/discover` | `camera:configure` (WS-Discovery on LAN; SSRF-validated) |
 | POST | `/api/cameras/onvif/streams` | `camera:configure` (get RTSP URIs from ONVIF device) |
-| GET/PUT/DELETE | `/api/cameras/{id}` | `camera:view` / `camera:configure` |
+| GET/PUT/DELETE | `/api/cameras/{id}` | `camera:view` / `camera:configure` (DELETE removes the camera: cascades its recordings/events/snapshots/detections/tracks, stops its live transcode, and the worker stops ingesting within ~30 s) |
 | GET | `/api/cameras/{id}/snapshot-url` | `camera:view` (mint a 300 s signed snapshot URL for <img> loads) |
 | GET | `/api/cameras/{id}/snapshot` | session token OR signed URL (one JPEG frame; honest 404/409/503) |
 | GET/POST | `/api/nvr` | `camera:configure` |

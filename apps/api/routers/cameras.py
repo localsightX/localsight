@@ -423,9 +423,33 @@ def update_camera(camera_id: str, body: dict, request: Request, db: Session = De
 @router.delete("/cameras/{camera_id}", dependencies=[Depends(require_permission("camera:configure"))])
 def delete_camera(camera_id: str, request: Request, db: Session = Depends(get_db),
                   rt: Runtime = Depends(get_runtime)):
+    """Remove a camera from the configuration.
+
+    Removal is immediate and irreversible. The camera row goes, FK cascades
+    take its detections, tracks, events, snapshots and recording segments, and
+    the media objects those rows point at are deleted best-effort (the rows are
+    the source of truth; an unreachable object store must not block a removal).
+
+    Two live resources are torn down as well, so a removed camera stops costing
+    CPU, bandwidth and disk:
+      * its LL-HLS live transcode, owned by this API process, and
+      * its worker pipeline, which notices the row is gone on its next
+        heartbeat (<= 30 s) and winds down its frame loop and recorder.
+
+    The audit entry is written before the row is deleted, so the record of WHO
+    removed WHICH camera survives the removal.
+    """
     cam = db.get(Camera, camera_id)
     if not cam:
         raise HTTPException(status_code=404, detail="camera not found")
+
+    # Stop the live transcode BEFORE the row disappears: ffmpeg must not keep
+    # writing into a camera id that no longer exists. Imported locally so the
+    # routers never become mutually load-bearing at import time.
+    from apps.api.routers.live import stop_camera_stream
+
+    live_stopped = stop_camera_stream(camera_id)
+
     # FK cascades (ondelete) remove the rows; their storage objects would
     # otherwise orphan forever, so collect keys first and delete best-effort.
     seg_keys = [
@@ -447,7 +471,7 @@ def delete_camera(camera_id: str, request: Request, db: Session = Depends(get_db
             rt.storage.delete(key)
         except Exception:
             pass
-    return {"ok": True}
+    return {"ok": True, "live_stream_stopped": live_stopped}
 
 
 # ── NVR archive: per-camera recordings for scrub-back playback ──────────────

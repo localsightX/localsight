@@ -172,6 +172,11 @@ async function loadCameraDetail(outEl, params) {
   }
   else if (tab === "retention") renderRetention(body, cam);
   else if (tab === "health") renderHealth(body, cam);
+
+  // Removal lives OUTSIDE the tab body on purpose: it is offered on every tab
+  // and must survive a tab switch (the tab body is rebuilt per tab). Gated on
+  // camera:configure — a read-only role never sees a destructive control.
+  if (can("camera:configure")) el.append(removeCameraCard(cam));
 }
 
 // Streams: URLs are encrypted write-only — show "configured", never the value.
@@ -272,4 +277,72 @@ function renderHealth(body, cam) {
     h("p", { class: "muted text-xs" },
       "Health history charts arrive with the Wave-4 analytics pass; today this is the live truth."),
   ));
+}
+
+// ── removal ───────────────────────────────────────────────────────────────
+// Destructive + irreversible, so it sits behind the same typed-confirm gate
+// as identity erasure (people.js) and user deletion (users.js): the operator
+// must type the camera's exact name before the button unlocks. The card is
+// self-wiring so the detail renderer stays a straight-line tab dispatch.
+
+function removeCameraCard(cam) {
+  const input = h("input", {
+    id: `rm-${cam.id}`,
+    "data-field": "confirm-name",
+    class: "mono",
+    autocomplete: "off",
+    "aria-label": `Type the camera name to confirm removal`,
+    placeholder: cam.name,
+  });
+  const confirmBtn = h("button", {
+    class: "ghost",
+    "data-act": "remove-camera-confirm",
+    disabled: true,
+  }, "Remove permanently");
+  const zone = h("div", { class: "confirm-zone hidden", "data-role": "remove-confirm" },
+    h("label", { class: "field-hint", for: `rm-${cam.id}` },
+      `Type the camera name “${cam.name}” to confirm`, input),
+    h("div", { class: "form-row" },
+      confirmBtn,
+      h("button", {
+        class: "ghost", type: "button", "data-act": "remove-camera-cancel",
+        onClick: () => zone.classList.add("hidden"),
+      }, "Cancel")),
+  );
+  const card = h("div", { class: "card", "data-role": "remove-camera" },
+    h("h3", {}, "Remove this camera"),
+    h("p", { class: "muted" },
+      "Removes the camera from the configuration and stops its ingestion (worker winds down "
+      + "within ~30 s; any live view stops immediately). Its recordings, events, snapshots, "
+      + "detections and tracks are deleted from storage — this cannot be undone. The audit "
+      + "entry recording who removed it is kept."),
+    h("button", {
+      class: "ghost",
+      "data-act": "remove-camera",
+      onClick: () => { zone.classList.remove("hidden"); input.focus(); },
+    }, "Remove camera…"),
+    zone,
+  );
+
+  input.addEventListener("input", () => {
+    confirmBtn.disabled = input.value.trim() !== cam.name;
+  });
+  confirmBtn.addEventListener("click", async () => {
+    // Double-submit guard (C-13): the row is going away either way, so both
+    // controls stay disabled on success and re-arm on failure.
+    confirmBtn.disabled = true;
+    input.disabled = true;
+    try {
+      await api(`/api/cameras/${cam.id}`, { method: "DELETE" });
+      toast(`Camera “${cam.name}” removed`, { tone: "ok" });
+      navigate("cameras");
+    } catch (err) {
+      confirmBtn.disabled = false;
+      input.disabled = false;
+      toast(err instanceof ApiError && err.status === 404
+        ? "Camera was already removed"
+        : (err.message || "Removal failed"), { tone: "error", timeout: 6000 });
+    }
+  });
+  return card;
 }

@@ -1080,6 +1080,102 @@ def test_camera_delete_cascades_children(client):
     assert d.status_code == 200, d.text
 
 
+# ── camera removal: stop live media, permission gate, audit ─────────────────
+def test_camera_delete_stops_live_transcode(client):
+    """Removing a camera must stop its live LL-HLS transcode — ffmpeg must not
+    keep writing under a camera id that no longer exists."""
+    from apps.api.routers import live as live_router
+
+    h = {"Authorization": _admin(client)}
+    cam_id = client.post("/api/cameras", json={"name": "cam-live-stop"}, headers=h).json()["id"]
+
+    class _FakeProc:
+        def __init__(self):
+            self.terminated = False
+            self._rc = None
+        def poll(self):
+            return self._rc
+        def terminate(self):
+            self.terminated = True
+            self._rc = 0
+        def wait(self, timeout=None):
+            return 0
+        def kill(self):
+            pass
+
+    proc = _FakeProc()
+    with live_router._live_lock:
+        live_router._live_streams[cam_id] = live_router._LiveStream(proc)
+
+    d = client.delete(f"/api/cameras/{cam_id}", headers=h)
+    assert d.status_code == 200, d.text
+    assert d.json()["live_stream_stopped"] is True
+    assert proc.terminated is True
+    with live_router._live_lock:
+        assert cam_id not in live_router._live_streams
+
+
+def test_camera_delete_without_transcode_reports_not_stopped(client):
+    """No live view open → the removal reports honestly that nothing was stopped."""
+    h = {"Authorization": _admin(client)}
+    cam_id = client.post("/api/cameras", json={"name": "cam-no-live"}, headers=h).json()["id"]
+    d = client.delete(f"/api/cameras/{cam_id}", headers=h)
+    assert d.status_code == 200, d.text
+    assert d.json()["live_stream_stopped"] is False
+
+
+def test_camera_delete_requires_configure_permission(client):
+    """A view-only role must never be able to remove a camera (destructive)."""
+    h = {"Authorization": _admin(client)}
+    cam_id = client.post("/api/cameras", json={"name": "cam-perm"}, headers=h).json()["id"]
+    vh = {"Authorization": _viewer(client)}
+    d = client.delete(f"/api/cameras/{cam_id}", headers=vh)
+    assert d.status_code == 403, d.text
+    assert client.get(f"/api/cameras/{cam_id}", headers=h).status_code == 200
+
+
+def test_camera_delete_unknown_is_404(client):
+    h = {"Authorization": _admin(client)}
+    assert client.delete("/api/cameras/00000000000000000000000000000000",
+                         headers=h).status_code == 404
+
+
+def test_camera_delete_is_audited_and_gone_from_list(client):
+    h = {"Authorization": _admin(client)}
+    cam_id = client.post("/api/cameras", json={"name": "cam-audit"}, headers=h).json()["id"]
+    assert client.delete(f"/api/cameras/{cam_id}", headers=h).status_code == 200
+    names = [c["name"] for c in client.get("/api/cameras", headers=h).json()]
+    assert "cam-audit" not in names
+    with client.app.state.runtime.SessionLocal() as s:
+        assert s.query(AuditLog).filter(
+            AuditLog.action == "camera.delete", AuditLog.resource == cam_id).count() == 1
+
+
+def test_worker_heartbeat_reports_removed_camera(client):
+    """The worker snapshots cameras at startup, so the per-frame heartbeat is
+    the ONLY way a removal reaches a running worker: a missing row must report
+    False (stop the pipeline) and a present row must touch last_seen."""
+    from apps.worker.main import heartbeat_camera
+    from packages.domain.models import Camera as CameraRow
+
+    rt = client.app.state.runtime
+    h = {"Authorization": _admin(client)}
+    cam_id = client.post("/api/cameras", json={"name": "cam-heartbeat"}, headers=h).json()["id"]
+
+    with rt.SessionLocal() as s:
+        s.get(CameraRow, cam_id).status = "ONLINE"
+        s.commit()
+    assert heartbeat_camera(rt, cam_id) is True
+    with rt.SessionLocal() as s:
+        assert s.get(CameraRow, cam_id).last_seen is not None
+
+    # remove the row behind the worker's back — exactly what DELETE does
+    with rt.SessionLocal() as s:
+        s.delete(s.get(CameraRow, cam_id))
+        s.commit()
+    assert heartbeat_camera(rt, cam_id) is False
+
+
 # ── regression: detection write gating (report F-04) ────────────────────────
 def test_stationary_track_writes_few_detections():
     """A track that doesn't move must not INSERT a Detection row per frame."""
