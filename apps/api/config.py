@@ -29,6 +29,14 @@ class Settings(BaseSettings):
     max_login_attempts: int = 5
     lockout_minutes: int = 15
 
+    # Trust X-Forwarded-For / proxy-derived client addresses for rate limiting
+    # and audit. Default FALSE: the header is client-controlled, so honoring it
+    # unconditionally lets an attacker rotate identities past the login rate
+    # limit (and forge audit source_ip). Enable ONLY behind a proxy that
+    # overwrites/extends the header (the shipped nginx front does), in which
+    # case the LAST entry — the one our own proxy appended — is used.
+    trust_proxy_headers: bool = False
+
     storage_backend: str = "local"
     storage_local_root: str = "./data/storage"
     storage_s3_bucket: str = ""

@@ -509,20 +509,22 @@ def test_rules_api(client):
 # ── alerts API ──────────────────────────────────────────────────────────────
 def test_alerts_api(client):
     h = {"Authorization": _admin(client)}
-    cfg = {"url": "https://example.test/hook"}
+    cfg = {"url": "https://1.1.1.1/hook"}
     r = client.post("/api/alerts/routes", json={"rule_type": "intrusion", "channel": "webhook", "config": cfg}, headers=h)
-    assert r.status_code == 200
+    assert r.status_code == 200, r.text
     rid = r.json()["id"]
     # config (secret) is NOT returned to the client
     listing = client.get("/api/alerts/routes", headers=h).json()
     assert all("config" not in item for item in listing)
     # unknown channel rejected
     assert client.post("/api/alerts/routes", json={"rule_type": "*", "channel": "telegram"}, headers=h).status_code == 400
-    # mqtt channel is supported and stored encrypted at rest
-    mqtt_cfg = {"host": "127.0.0.1", "port": 1883, "topic": "localsight/{camera_id}/alerts",
+    # mqtt channel is supported and stored encrypted at rest. The new SSRF gate
+    # rejects loopback brokers (127.0.0.1), so this exercises the allowlisted
+    # fake camera VLAN (192.168.99.0/24) from conftest instead.
+    mqtt_cfg = {"host": "192.168.99.10", "port": 1883, "topic": "localsight/{camera_id}/alerts",
                 "username": "mqtt", "password": "s3cret"}
     m = client.post("/api/alerts/routes", json={"rule_type": "*", "channel": "mqtt", "config": mqtt_cfg}, headers=h)
-    assert m.status_code == 200
+    assert m.status_code == 200, m.text
     mrid = m.json()["id"]
     listing = client.get("/api/alerts/routes", headers=h).json()
     assert any(item["id"] == mrid and item["channel"] == "mqtt" for item in listing)
@@ -532,10 +534,14 @@ def test_alerts_api(client):
     assert client.delete(f"/api/alerts/routes/{mrid}", headers=h).status_code == 200
     # test alert delivers to 0 webhooks (env not set) -> no crash
     assert client.post("/api/alerts/test", headers=h).json()["delivered"] == 0
-    # push (ntfy) channel accepted; unreachable server -> 0 delivered, no crash
-    push_cfg = {"server": "http://127.0.0.1:1", "topic": "localsight-test", "priority": 3}
+    # push (ntfy) channel accepted; unreachable server -> 0 delivered, no crash.
+    # Same SSRF note as MQTT above: the bare allowlisted VLAN host needs no DNS
+    # and passes the gate (the send itself still fails closed → delivered 0).
+    # NOTE: the "server" value is a host, not a URL — passing a full URL here
+    # would embed "https://" inside the synthetic "https://…" probe and fail.
+    push_cfg = {"server": "192.168.99.10", "topic": "localsight-test", "priority": 3}
     p = client.post("/api/alerts/routes", json={"rule_type": "*", "channel": "push", "config": push_cfg}, headers=h)
-    assert p.status_code == 200
+    assert p.status_code == 200, p.text
     prid = p.json()["id"]
     listing2 = client.get("/api/alerts/routes", headers=h).json()
     assert any(item["id"] == prid and item["channel"] == "push" for item in listing2)
@@ -610,7 +616,9 @@ def test_cooldown_tracker():
 def test_worker_alert_cooldown(client):
     from apps.worker import main as worker_main
     h = {"Authorization": _admin(client)}
-    mqtt_cfg = {"host": "127.0.0.1", "port": 1883, "topic": "l/{camera_id}"}
+    # Loopback brokers are rejected by the route SSRF gate; the allowlisted
+    # fake camera VLAN (conftest) passes validation but has no broker.
+    mqtt_cfg = {"host": "192.168.99.10", "port": 1883, "topic": "l/{camera_id}"}
     r = client.post("/api/alerts/routes", json={
         "rule_type": "intrusion", "channel": "mqtt", "config": mqtt_cfg,
         "cooldown_sec": 300,
@@ -637,7 +645,7 @@ def test_worker_alert_cooldown(client):
 
 def test_alert_route_cooldown_field(client):
     h = {"Authorization": _admin(client)}
-    cfg = {"host": "127.0.0.1", "port": 1883, "topic": "l"}
+    cfg = {"host": "192.168.99.10", "port": 1883, "topic": "l"}
     r = client.post("/api/alerts/routes", json={
         "rule_type": "line_cross", "channel": "mqtt", "config": cfg,
         "cooldown_sec": 120,

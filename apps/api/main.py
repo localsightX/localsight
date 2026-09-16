@@ -66,9 +66,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # Middleware order: outermost first. RequestId innermost-of-these so others
     # can read state; CORS outermost; security headers wrap responses.
     app.add_middleware(SecurityHeadersMiddleware, enable_hsts=settings.is_production)
+    # CORS + credentials: allow_credentials=True with a wildcard origin echoes
+    # ANY origin back with Access-Control-Allow-Credentials, so a phishing page
+    # can drive the API with the victim's cookies/tokens. Forbid that combo at
+    # startup — origins must be enumerated whenever credentials are allowed.
+    _origins = settings.cors_origins
+    if "*" in _origins:
+        raise RuntimeError(
+            "CORS_ALLOW_ORIGINS must enumerate explicit origins "
+            f"(got {_origins}); the wildcard is not permitted with credentials."
+        )
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=settings.cors_origins or ["*"],
+        allow_origins=_origins,
         allow_credentials=True,
         allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
         allow_headers=["Authorization", "Content-Type"],

@@ -90,8 +90,14 @@ class TestRefreshOn401:
               return orig(input, init);
             };
           }""")
-        page.click("#nav button[data-view='privacy']")
-        page.wait_for_timeout(3000)
+                # Dispatch the nav click directly: a dead session fires auth:expired
+        # asynchronously during privacy view load, which calls leaveApp() —
+        # hiding #app (the nav button's parent) mid-click and causing
+        # Playwright's actionability check to time out. Bypass the check and
+        # assert on the outcome instead.
+        page.evaluate(
+            "document.querySelector(\"#nav button[data-view='privacy']\").click()")
+        page.wait_for_selector("#login:not(.hidden)", timeout=10000)
         login_visible = page.evaluate(
             "!document.getElementById('login').classList.contains('hidden')")
         assert login_visible, "dead session must land on the login screen"

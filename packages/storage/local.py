@@ -13,6 +13,7 @@ import os
 import shutil
 import time
 import urllib.parse
+from collections.abc import Iterator
 
 from packages.storage.base import StorageProvider
 
@@ -69,6 +70,32 @@ class LocalFilesystemStorage(StorageProvider):
         with open(self._resolve(key), "rb") as fh:
             return fh.read()
 
+    def size(self, key: str) -> int:
+        return os.path.getsize(self._resolve(key))
+
+    def read_range(self, key: str, start: int, end: int) -> Iterator[bytes]:
+        """Yield bytes[start:end+1] via seek (64 KiB chunks, O(1) memory).
+
+        The media endpoint serves multi-hundred-MB recordings through here, so
+        the file is never buffered whole — a full-segment GET streams from disk
+        in chunks, and a Range GET seeks straight to the requested window.
+        """
+        path = self._resolve(key)  # same traversal gate as get()
+        size = os.path.getsize(path)
+        start = max(0, start)
+        end = min(end, size - 1)
+        if start > end:
+            return
+        with open(path, "rb") as fh:
+            fh.seek(start)
+            remaining = end - start + 1
+            while remaining > 0:
+                chunk = fh.read(min(65536, remaining))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+                yield chunk
+
     def delete(self, key: str) -> None:
         try:
             os.remove(self._resolve(key))
@@ -87,6 +114,10 @@ class LocalFilesystemStorage(StorageProvider):
         return mac.hexdigest()
 
     def sign_get_url(self, key: str, expires_sec: int = 300) -> str:
+        # Cap the TTL: a signed URL is a bearer credential for the object, so an
+        # unbounded expiry is a permanent public link in disguise. The narrowest
+        # window callers need is the DVR scrubber (~1 h), hence the ceiling.
+        expires_sec = max(1, min(expires_sec, 3600))
         exp = int(time.time()) + expires_sec
         sig = self._sig(key, exp)
         return f"/api/video/{urllib.parse.quote(key, safe='')}?exp={exp}&sig={sig}"
@@ -96,7 +127,11 @@ class LocalFilesystemStorage(StorageProvider):
             exp_i = int(exp)
         except ValueError:
             return False
-        if exp_i < int(time.time()):
+        now = int(time.time())
+        # Skew + cap: reject expired links, but also links whose expiry lies
+        # beyond the signing ceiling — a leaked signer must not be able to mint
+        # effectively-permanent bearer URLs by stuffing a far-future `exp`.
+        if exp_i < now or exp_i > now + 3600 + 60:
             return False
         expected = self._sig(key, exp_i)
         return hmac.compare_digest(expected, sig or "")

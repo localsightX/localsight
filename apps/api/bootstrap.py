@@ -158,10 +158,22 @@ def seed(rt: Runtime) -> None:
         # Only bootstrap admin if no users exist yet.
         if session.query(User).count() == 0 and settings_bootstrap_email(rt):
             role_admin = session.query(Role).filter_by(name="ADMIN").first()
+            # Refuse an insecure bootstrap password: seeding a well-known default
+            # admin credential on first run is a standing backdoor for anyone
+            # who knows the repo. The bootstrap email gate stays, but a
+            # blank/weak BOOTSTRAP_ADMIN_PASSWORD is a startup failure,
+            # not a default login.
+            if not rt.settings.bootstrap_admin_password or len(
+                rt.settings.bootstrap_admin_password
+            ) < 12:
+                raise RuntimeError(
+                    "BOOTSTRAP_ADMIN_PASSWORD is missing or too short (min 12 chars). "
+                    "Set a strong initial admin password before first boot."
+                )
             admin = User(
                 email=rt.settings.bootstrap_admin_email,
                 full_name="Bootstrap Administrator",
-                password_hash=hash_password(rt.settings.bootstrap_admin_password or "CHANGE_ME_STRONG_PASSWORD"),
+                password_hash=hash_password(rt.settings.bootstrap_admin_password),
                 role_id=role_admin.id,
                 is_active=True,
             )

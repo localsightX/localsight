@@ -67,11 +67,28 @@ def require_permission(permission: str):
     return checker
 
 
-def rate_limit(bucket: str, rate: float, capacity: int):
-    def checker(request: Request) -> None:
-        # key by IP (proxy-aware via X-Forwarded-For first hop when present)
+def client_ip(request: Request, *, trust_proxy: bool = False) -> str:
+    """Derive the client address for rate limiting and audit records.
+
+    `X-Forwarded-For` is attacker-controlled input unless a trusted proxy
+    overwrote/extended it — and even then the FIRST entry is the one the client
+    itself sent. The default (trust_proxy=False) therefore keys on the socket
+    address only: a spoofed header must never gate a rate limit or forge an
+    audit trail. Behind the shipped nginx front (which APPENDS the socket
+    address to any incoming header), set TRUST_PROXY_HEADERS=1 to use the LAST
+    entry — the one our own proxy added.
+    """
+    if trust_proxy:
         fwd = request.headers.get("X-Forwarded-For", "")
-        ip = fwd.split(",")[0].strip() or request.client.host if request.client else "unknown"
+        hops = [hop.strip() for hop in fwd.split(",") if hop.strip()]
+        if hops:
+            return hops[-1]
+    return request.client.host if request.client else "unknown"
+
+
+def rate_limit(bucket: str, rate: float, capacity: int):
+    def checker(request: Request, rt: Runtime = Depends(get_runtime)) -> None:
+        ip = client_ip(request, trust_proxy=rt.settings.trust_proxy_headers)
         if not limiter.allow(ip, bucket, rate, capacity):
             raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="rate limit exceeded")
 
@@ -83,6 +100,7 @@ def get_request_id(request: Request) -> str:
 
 
 __all__ = [
-    "get_runtime", "get_settings", "get_db", "get_current_user", "require_permission",
-    "rate_limit", "get_request_id", "limiter", "Runtime", "RefreshToken", "dt",
+    "Runtime", "RefreshToken", "dt", "get_current_user", "get_db",
+    "get_request_id", "get_runtime", "get_settings", "limiter",
+    "rate_limit", "require_permission",
 ]

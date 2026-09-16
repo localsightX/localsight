@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import datetime as dt
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
@@ -45,11 +45,75 @@ def list_routes(db: Session = Depends(get_db)):
     ]
 
 
+def _validate_route_destination(channel: str, cfg: dict, allowlist: list[str]) -> None:
+    """Validate an alert route's egress destination against the SSRF policy.
+
+    Webhook URLs go through the full URL validator (scheme + DNS + blocklist).
+    Host-bearing channels (MQTT broker, push server, SMTP host) are validated by
+    wrapping the host in a synthetic URL — same DNS/blocklist/allowlist rules,
+    since the platform dials them unattended on every alert. NO test-fixture
+    carve-outs: 127.0.0.1/::1 are rejected unless the operator explicitly
+    allowlists loopback (e.g. the dev rig's local broker) — a fixture bypass
+    here is a standing SSRF primitive for any alerts:manage holder.
+    """
+    if channel == "webhook":
+        url = (cfg.get("url") or "").strip()
+        if not url:
+            raise HTTPException(
+                status_code=400,
+                detail="webhook route requires config.url")
+        try:
+            validate_egress_url(url, allowlist=allowlist)
+        except UnsafeUrlError as exc:
+            raise HTTPException(status_code=400, detail=f"unsafe webhook: {exc}") from exc
+    elif channel in ("mqtt", "push"):
+        host_key = "host" if channel == "mqtt" else "server"
+        host = (cfg.get(host_key) or "").strip()
+        if not host:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{channel} route requires config.{host_key}")
+        port = cfg.get("port", 1883 if channel == "mqtt" else 443)
+        try:
+            port_i = int(port)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"invalid {channel} port: {port!r}") from exc
+        if not 1 <= port_i <= 65535:
+            raise HTTPException(status_code=400, detail=f"invalid {channel} port: {port_i}")
+        scheme = "mqtt" if channel == "mqtt" else "https"
+        try:
+            validate_egress_url(f"{scheme}://{host}:{port_i}/",
+                                allowlist=allowlist,
+                                allowed_schemes={scheme, "mqtts"} if channel == "mqtt" else None)
+        except UnsafeUrlError as exc:
+            raise HTTPException(status_code=400, detail=f"unsafe {channel} destination: {exc}") from exc
+    elif channel == "email":
+        smtp_host = (cfg.get("smtp_host") or "").strip()
+        if not smtp_host:
+            raise HTTPException(
+                status_code=400,
+                detail="email route requires config.smtp_host")
+        try:
+            validate_egress_url(f"smtp://{smtp_host}:25/", allowlist=allowlist,
+                                allowed_schemes={"smtp"})
+        except UnsafeUrlError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"unsafe smtp destination: {exc}") from exc
+
+
 @router.post("/alerts/routes", dependencies=[Depends(require_permission("alerts:manage"))])
 def create_route(body: RouteCreate, request: Request, db: Session = Depends(get_db),
                  rt: Runtime = Depends(get_runtime)):
     if body.channel not in ("webhook", "email", "push", "mqtt"):
         raise HTTPException(status_code=400, detail="unknown channel")
+    # SSRF validation BEFORE persist: a route stores an egress destination that
+    # the worker later dials unattended. An internal-only target persisted here
+    # becomes a standing proxy primitive, so fail the create loudly instead of
+    # letting it (or test_alert) skip the route at send time.
+    _validate_route_destination(body.channel, body.config or {}, rt.settings.ssrf_allowlist_cidrs)
     route = AlertRoute(
         rule_type=body.rule_type, camera_id=body.camera_id, channel=body.channel,
         enabled=body.enabled, cooldown_sec=body.cooldown_sec,

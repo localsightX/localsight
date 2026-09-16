@@ -33,6 +33,7 @@ def main() -> int:
 
     jwt = _key()
     mek = _key()
+    admin_pw = secrets.token_urlsafe(24)
     lines = []
     with open(EXAMPLE) as fh:
         for raw in fh:
@@ -41,11 +42,15 @@ def main() -> int:
                 line = f"JWT_SECRET={jwt}"
             elif line.startswith("MASTER_ENCRYPTION_KEY="):
                 line = f"MASTER_ENCRYPTION_KEY={mek}"
+            elif line.startswith("BOOTSTRAP_ADMIN_PASSWORD="):
+                line = f"BOOTSTRAP_ADMIN_PASSWORD={admin_pw}"
             lines.append(line)
     with open(OUT, "w") as fh:
         fh.write("\n".join(lines) + "\n")
     print(f"Wrote {OUT} with fresh random secrets.")
-    print("Edit BOOTSTRAP_ADMIN_PASSWORD and review retention/URLs before deploying.")
+    print("Review retention/URLs before deploying. The bootstrap admin password")
+    print("was minted randomly — record it now; it cannot be recovered:")
+    print(f"  BOOTSTRAP_ADMIN_PASSWORD={admin_pw}")
     return 0
 
 
