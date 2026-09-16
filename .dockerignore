@@ -6,6 +6,12 @@
 !.env.example
 *.db
 *.db-journal
+# TLS material never ships inside an image layer (keys are secrets; the
+# compose stack mounts the certs read-only at runtime instead).
+*.key
+*.crt
+*.pem
+infrastructure/nginx/certs/
 data/
 .venv/
 venv/

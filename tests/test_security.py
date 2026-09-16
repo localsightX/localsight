@@ -69,6 +69,57 @@ def test_ssrf_allows_public(client, admin_auth):
     assert r.status_code == 200
 
 
+def test_ssrf_rejects_decimal_octet_bypass():
+    """Decimal/0x/octal IP spellings bypass naive string allowlists (rule H-S1).
+
+    `parse_ip_literal` normalizes them, so 2130706433 (== 127.0.0.1) and
+    0x7f.0.0.1 must still be rejected without an explicit allowlist.
+    """
+    for evil in ["http://2130706433/", "http://0x7f.0.0.1/", "http://0177.0.0.1/"]:
+        with pytest.raises(UnsafeUrlError):
+            validate_egress_url(evil)
+
+
+def test_ssrf_rejects_userinfo_spoof():
+    """Credentials must be unwrapped before host validation (rule H-S1).
+
+    `https://public.com@169.254.169.254/` connects to the metadata IP; an
+    authority-string comparison against "public.com" would wrongly allow it.
+    """
+    with pytest.raises(UnsafeUrlError):
+        validate_egress_url("https://example.com@169.254.169.254/")
+    with pytest.raises(UnsafeUrlError):
+        validate_egress_url("https://user:pass@127.0.0.1:554/stream")
+
+
+def test_alert_route_rejects_internal_webhook(client, admin_auth):
+    """Alert routes are standing egress — validation must happen at create."""
+    # Metadata-IP webhook must be rejected with 400, not persisted.
+    r = client.post("/api/alerts/routes",
+                    json={"rule_type": "motion", "channel": "webhook",
+                          "config": {"url": "http://169.254.169.254/hook"}},
+                    headers=admin_auth)
+    assert r.status_code == 400, f"expected block, got {r.status_code}: {r.text}"
+    assert r.json().get("id") is None
+    # Same for host-bearing channels. NOTE: conftest allowlists 192.168.99.0/24
+    # (the fake camera VLAN), so a 127.0.0.1 MQTT broker must STILL be rejected.
+    r2 = client.post("/api/alerts/routes",
+                     json={"rule_type": "motion", "channel": "mqtt",
+                           "config": {"host": "127.0.0.1", "port": 1883}},
+                     headers=admin_auth)
+    assert r2.status_code == 400, f"expected block, got {r2.status_code}: {r2.text}"
+
+
+def test_alert_route_accepts_public_webhook(client, admin_auth):
+    # Numeric public IP — no DNS needed (CI/dev networks may have no resolver).
+    r = client.post("/api/alerts/routes",
+                    json={"rule_type": "motion", "channel": "webhook",
+                          "config": {"url": "https://1.1.1.1/x"}},
+                    headers=admin_auth)
+    assert r.status_code == 200, r.text
+    assert "id" in r.json()
+
+
 def test_validate_egress_unit():
     with pytest.raises(UnsafeUrlError):
         validate_egress_url("http://169.254.169.254/")
@@ -112,3 +163,67 @@ def test_signed_url_tamper_rejected(tmp_path):
     exp = q["exp"][0]
     assert store.verify_signed_url("seg/1.mp4", exp, sig) is True
     assert store.verify_signed_url("seg/1.mp4", exp, "deadbeef") is False
+
+
+def test_signed_url_ttl_capped(tmp_path):
+    """Signed URLs are bearer credentials — expiry must be bounded (rule H-S6).
+
+    A multi-year TTL is silently clamped to ≤1 h so a leaked URL eventually
+    dies instead of becoming a permanent public link.
+    """
+    import time
+    store = LocalFilesystemStorage(str(tmp_path), "signing-secret-1234567890")
+    store.put("seg/1.mp4", b"data")
+    url = store.sign_get_url("seg/1.mp4", expires_sec=10 * 365 * 86400)
+    from urllib.parse import urlparse, parse_qs
+    q = parse_qs(urlparse(url).query)
+    assert int(q["exp"][0]) - int(time.time()) <= 3600
+
+
+def test_storage_symlink_escape_rejected(tmp_path):
+    """A symlink inside the storage root must not redirect writes (rule H-S4)."""
+    import os
+    store = LocalFilesystemStorage(str(tmp_path), "signing-secret-1234567890")
+    outside = tmp_path / "outside.txt"
+    (tmp_path / "linkdir").symlink_to(tmp_path, target_is_directory=True)
+    with pytest.raises(ValueError):
+        store.put("linkdir/../outside.txt", b"data")
+    assert not outside.exists()
+    # ... nor reads through an absolute-path symlink hop.
+    os.symlink(str(outside), tmp_path / "evil.txt")
+    with pytest.raises((ValueError, FileNotFoundError)):
+        store.get("evil.txt")
+
+
+def test_rate_limiter_memory_bounded():
+    """Distinct-key floods (spoofed IPs) must not grow the table forever."""
+    from packages.security.ratelimit import RateLimiter
+    rl = RateLimiter(max_buckets=100)
+    for i in range(5000):
+        rl.allow(f"10.9.{i // 256}.{i % 256}", "login", rate=1.0, capacity=10)
+    assert rl.bucket_count() <= 5000  # flood keys stay live while hot ...
+    import time as _t
+    _t.sleep(1.2)  # ... but idle keys are reclaimed on the next call.
+    rl.allow("203.0.113.9", "login", rate=1.0, capacity=10)
+    assert rl.bucket_count() < 5000
+
+
+def test_login_enumeration_timing_shape(client):
+    """Unknown vs wrong-password logins share status + cost profile (rule H-A2).
+
+    Both return 401 without a 423/lockout distinction, and the unknown-account
+    branch still pays for exactly one Argon2 verify (no fast path).
+    """
+    import time as _t
+    t0 = _t.perf_counter()
+    r_unknown = client.post("/api/auth/login",
+                            json={"email": "nobody-here@test.com", "password": "wrongpassword1"})
+    t_unknown = _t.perf_counter() - t0
+    t0 = _t.perf_counter()
+    r_wrong = client.post("/api/auth/login",
+                          json={"email": "admin@test.com", "password": "wrongpassword1"})
+    t_wrong = _t.perf_counter() - t0
+    assert r_unknown.status_code == 401 == r_wrong.status_code
+    # Same order of magnitude (single Argon2 verify each) — a 10x gap would
+    # mean one branch skipped the hash.
+    assert t_unknown > 0.25 * t_wrong

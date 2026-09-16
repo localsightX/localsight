@@ -49,7 +49,7 @@ services:
       METRICS_SCRAPE_TOKEN: ${METRICS_SCRAPE_TOKEN:-}
     volumes:
       - storage:/app/data/storage
-      - ./models:/app/models
+      - ../../models:/app/models
     depends_on:
       postgres:
         condition: service_healthy
@@ -74,11 +74,20 @@ services:
       MASTER_ENCRYPTION_KEY: ${MASTER_ENCRYPTION_KEY}
       STORAGE_BACKEND: local
       STORAGE_LOCAL_ROOT: /app/data/storage
+      # The worker is the process that actually DIALS cameras, so it needs the
+      # same SSRF allowlist as the api. Without it every private-LAN camera is
+      # rejected when the frame source is built (and the camera thread dies
+      # silently): the api would accept the camera while the worker never
+      # ingested a single frame.
+      SSRF_ALLOWLIST: ${SSRF_ALLOWLIST:-}
       AI_DETECTOR: ${AI_DETECTOR:-reference}
       AI_IDENTITY_RECOGNITION_ENABLED: ${AI_IDENTITY_RECOGNITION_ENABLED:-false}
+      RECORD_SEGMENT_SECONDS: ${RECORD_SEGMENT_SECONDS:-300}
     volumes:
       - storage:/app/data/storage
-      - ./models:/app/models
+      # `./models` resolves relative to THIS file (infrastructure/compose/models,
+      # which does not exist) — mount the repo's staged model registry instead.
+      - ../../models:/app/models
     depends_on:
       postgres:
         condition: service_healthy

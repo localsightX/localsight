@@ -408,11 +408,23 @@ def update_camera(camera_id: str, body: dict, request: Request, db: Session = De
     for f in ("name", "resolution", "fps", "timezone", "privacy_masks", "retention"):
         if f in body:
             setattr(cam, f, body[f])
+    # UnsafeUrlError is a 400, not a 500: validate_egress_url raises (it doesn't
+    # return False), so an uncaught raise here bypassed the 400 handler above
+    # and surfaced as an internal error — leaking stack behavior and breaking
+    # the API contract that bad destinations are client errors.
     if body.get("stream_url"):
-        validate_egress_url(body["stream_url"], allowlist=rt.settings.ssrf_allowlist_cidrs)
+        try:
+            validate_egress_url(body["stream_url"], allowlist=rt.settings.ssrf_allowlist_cidrs)
+        except UnsafeUrlError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                                detail=f"stream_url: {exc}") from exc
         cam.stream_url_enc = rt.crypto.encrypt_str(body["stream_url"])
     if body.get("substream_url"):
-        validate_egress_url(body["substream_url"], allowlist=rt.settings.ssrf_allowlist_cidrs)
+        try:
+            validate_egress_url(body["substream_url"], allowlist=rt.settings.ssrf_allowlist_cidrs)
+        except UnsafeUrlError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                                detail=f"substream_url: {exc}") from exc
         cam.substream_url_enc = rt.crypto.encrypt_str(body["substream_url"])
     write_audit(db, user=request.state.user, action="camera.update", resource=camera_id,
                 request_id=getattr(request.state, "request_id", "-"))

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Iterator
 
 
 class StorageProvider(ABC):
@@ -22,6 +23,24 @@ class StorageProvider(ABC):
 
     @abstractmethod
     def get(self, key: str) -> bytes:
+        ...
+
+    @abstractmethod
+    def size(self, key: str) -> int:
+        """Byte length of `key` (raises FileNotFoundError when absent).
+
+        Exists so the media endpoint can answer HTTP Range requests without
+        buffering the object — range reads go through `read_range`.
+        """
+        ...
+
+    @abstractmethod
+    def read_range(self, key: str, start: int, end: int) -> Iterator[bytes]:
+        """Yield bytes[start:end+1] of `key` in chunks (inclusive bounds).
+
+        Must validate the key exactly like `get` (traversal-safe) and raise
+        FileNotFoundError when absent. Out-of-range bounds are clamped.
+        """
         ...
 
     @abstractmethod
@@ -49,6 +68,7 @@ class StorageProvider(ABC):
 
         Implementations share one HMAC scheme (SHA-256 over `key:exp` with the
         deployment signing secret) so the media endpoint authorizes the same
-        way regardless of backend.
+        way regardless of backend. `exp` must be an integer epoch within the
+        signing cap window — over-long or non-numeric values are rejected.
         """
         ...

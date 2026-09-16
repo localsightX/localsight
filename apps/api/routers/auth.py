@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 
 from apps.api.audit import write_audit
 from apps.api.bootstrap import Runtime
-from apps.api.dependencies import get_current_user, get_db, get_runtime, rate_limit
+from apps.api.dependencies import client_ip, get_current_user, get_db, get_runtime, rate_limit
 from packages.domain.models import RefreshToken, Role, User
 from packages.domain.timeutil import iso
 from packages.security.errors import AuthError
@@ -32,9 +32,9 @@ _DUMMY_HASH = hash_password("dummy-password-not-used")
 
 
 class LoginBody(BaseModel):
-    email: str
-    password: str
-    mfa_code: str | None = None
+    email: str = Field(max_length=320)
+    password: str = Field(max_length=256)
+    mfa_code: str | None = Field(default=None, max_length=16)
 
 
 class TokenBody(BaseModel):
@@ -46,11 +46,6 @@ class MfaSetupOut(BaseModel):
     otpauth_uri: str
 
 
-def _client_ip(request: Request) -> str:
-    fwd = request.headers.get("X-Forwarded-For", "")
-    return (fwd.split(",")[0].strip() or (request.client.host if request.client else "unknown"))
-
-
 def _permissions_for(db: Session, user: User) -> list[str]:
     role = db.get(Role, user.role_id)
     return sorted(effective_permissions([role.name]))
@@ -59,8 +54,18 @@ def _permissions_for(db: Session, user: User) -> list[str]:
 @router.post("/login", dependencies=[Depends(rate_limit("login", rate=1.0, capacity=10))])
 def login(body: LoginBody, request: Request, db: Session = Depends(get_db), rt: Runtime = Depends(get_runtime)):
     rid = getattr(request.state, "request_id", "-")
-    ip = _client_ip(request)
+    ip = client_ip(request, trust_proxy=rt.settings.trust_proxy_headers)
+    # Hash-then-compare order: verify the password FIRST (or the dummy hash for
+    # unknown accounts), THEN report lockout. Reversing this leaks account
+    # existence — an attacker can distinguish "unknown email" (fast 401) from
+    # "known but locked email" (423) without ever knowing a password.
     user = db.query(User).filter(User.email == body.email).first()
+    locked = False
+    if user and user.locked_until is not None:
+        lu = user.locked_until
+        if lu.tzinfo is None:
+            lu = lu.replace(tzinfo=dt.UTC)
+        locked = lu > dt.datetime.now(dt.UTC)
 
     # User-enumeration hardening: ALWAYS run exactly one Argon2 verify against
     # a fixed precomputed dummy hash when the account doesn't exist. Both
@@ -69,15 +74,11 @@ def login(body: LoginBody, request: Request, db: Session = Depends(get_db), rt: 
     hashed = user.password_hash if user is not None else _DUMMY_HASH
     ok = verify_password(body.password, hashed)
 
-    if user and user.locked_until is not None:
-        lu = user.locked_until
-        if lu.tzinfo is None:
-            lu = lu.replace(tzinfo=dt.UTC)
-        if lu > dt.datetime.now(dt.UTC):
-            write_audit(db, username=body.email, action="login", result="failure", source_ip=ip,
-                        request_id=rid, detail={"reason": "locked"})
-            db.commit()
-            raise HTTPException(status_code=status.HTTP_423_LOCKED, detail="account locked; try later")
+    if locked:
+        write_audit(db, username=body.email, action="login", result="failure", source_ip=ip,
+                    request_id=rid, detail={"reason": "locked"})
+        db.commit()
+        raise HTTPException(status_code=status.HTTP_423_LOCKED, detail="account locked; try later")
 
     if not user or not ok:
         if user:
@@ -136,7 +137,7 @@ def _issue_refresh(db: Session, user: User, rt: Runtime) -> str:
 @router.post("/refresh", dependencies=[Depends(rate_limit("refresh", rate=2.0, capacity=20))])
 def refresh(body: TokenBody, request: Request, db: Session = Depends(get_db), rt: Runtime = Depends(get_runtime)):
     rid = getattr(request.state, "request_id", "-")
-    ip = _client_ip(request)
+    ip = client_ip(request, trust_proxy=rt.settings.trust_proxy_headers)
     try:
         claims = decode_token(body.refresh_token, rt.settings.jwt_secret, "refresh")
     except AuthError as exc:
@@ -175,7 +176,7 @@ def refresh(body: TokenBody, request: Request, db: Session = Depends(get_db), rt
 @router.post("/logout")
 def logout(body: TokenBody, request: Request, db: Session = Depends(get_db), rt: Runtime = Depends(get_runtime)):
     rid = getattr(request.state, "request_id", "-")
-    ip = _client_ip(request)
+    ip = client_ip(request, trust_proxy=rt.settings.trust_proxy_headers)
     try:
         claims = decode_token(body.refresh_token, rt.settings.jwt_secret, "refresh")
     except AuthError:
@@ -203,8 +204,8 @@ def me(request: Request, db: Session = Depends(get_db), user: User = Depends(get
 
 
 class PasswordChangeBody(BaseModel):
-    old_password: str
-    new_password: str = Field(min_length=12)
+    old_password: str = Field(max_length=256)
+    new_password: str = Field(min_length=12, max_length=256)
 
 
 @router.post("/password", dependencies=[Depends(rate_limit("password", rate=0.2, capacity=5))])
@@ -220,7 +221,7 @@ def change_password(
     sign out; this session keeps working), and audits the rotation.
     Rate-limited: 5 attempts / 25 s per IP."""
     rid = getattr(request.state, "request_id", "-")
-    ip = _client_ip(request)
+    ip = client_ip(request, trust_proxy=rt.settings.trust_proxy_headers)
     if not verify_password(body.old_password, user.password_hash):
         write_audit(db, user=user, action="user.password_change", result="failure",
                     source_ip=ip, request_id=rid, detail={"reason": "bad_credentials"})

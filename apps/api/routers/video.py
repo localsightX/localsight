@@ -9,7 +9,8 @@ from __future__ import annotations
 
 import mimetypes
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi.responses import StreamingResponse
 
 from apps.api.bootstrap import Runtime
 from apps.api.dependencies import get_runtime
@@ -24,7 +25,7 @@ def serve_video(
     exp: str = Query(...),
     sig: str = Query(...),
     rt: Runtime = Depends(get_runtime),
-):
+) -> StreamingResponse:
     """Serve a media object via its signed, expiring URL.
 
     Authorization is the URL signature itself — an HMAC over `key:exp` with
@@ -37,12 +38,63 @@ def serve_video(
 
     Signed URLs are issued only by permissioned endpoints (event detail,
     export, clip assembly), which audit every issuance.
+
+    Large recordings stream from disk (never buffered into the heap) with
+    HTTP Range support so <video> scrubbing works without re-downloading.
     """
     if not rt.storage.verify_signed_url(key, exp, sig):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="invalid or expired link")
-    try:
-        data = rt.storage.get(key)
-    except FileNotFoundError:
-        raise HTTPException(status_code=404, detail="not found") from None
     ctype = mimetypes.guess_type(key)[0] or "application/octet-stream"
-    return Response(content=data, media_type=ctype, headers={"Cache-Control": "no-store"})
+    headers = {"Cache-Control": "no-store", "Accept-Ranges": "bytes"}
+    try:
+        size = rt.storage.size(key)
+    except (FileNotFoundError, ValueError, OSError):
+        raise HTTPException(status_code=404, detail="not found") from None
+    range_hdr = request.headers.get("range")
+    if range_hdr:
+        start, end = _parse_range(range_hdr, size)
+        if start is None:
+            return StreamingResponse(
+                iter([b""]),
+                status_code=416,
+                headers={**headers, "Content-Range": f"bytes */{size}"},
+            )
+        return StreamingResponse(
+            rt.storage.read_range(key, start, end),
+            status_code=206,
+            media_type=ctype,
+            headers={
+                **headers,
+                "Content-Range": f"bytes {start}-{end}/{size}",
+                "Content-Length": str(end - start + 1),
+            },
+        )
+    return StreamingResponse(
+        rt.storage.read_range(key, 0, size - 1),
+        media_type=ctype,
+        headers={**headers, "Content-Length": str(size)},
+    )
+
+
+def _parse_range(header: str, size: int) -> tuple[int | None, int]:
+    """Parse a single `bytes=start-end` range. Returns (start, end) inclusive,
+    or (None, 0) when unsatisfiable (caller answers 416)."""
+    try:
+        units, spec = header.strip().split("=", 1)
+        if units.strip().lower() != "bytes":
+            return None, 0
+        start_s, _, end_s = spec.strip().partition("-")
+        if start_s:
+            start = int(start_s)
+            end = int(end_s) if end_s else size - 1
+        elif end_s:
+            # Suffix range: last N bytes.
+            start = max(0, size - int(end_s))
+            end = size - 1
+        else:
+            return None, 0
+    except ValueError:
+        return None, 0
+    if start < 0 or end < start or start >= size:
+        return None, 0
+    return start, min(end, size - 1)

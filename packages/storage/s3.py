@@ -15,6 +15,7 @@ import hmac
 import os
 import time
 import urllib.parse
+from collections.abc import Iterator
 
 from packages.storage.base import StorageProvider
 
@@ -70,6 +71,33 @@ class S3CompatibleStorage(StorageProvider):
         except ClientError as exc:  # pragma: no cover
             raise FileNotFoundError(key) from exc
 
+    def size(self, key: str) -> int:
+        from botocore.exceptions import ClientError
+
+        try:
+            head = self._client.head_object(Bucket=self._bucket, Key=self._full_key(key))
+            return int(head["ContentLength"])
+        except ClientError as exc:  # pragma: no cover
+            raise FileNotFoundError(key) from exc
+
+    def read_range(self, key: str, start: int, end: int) -> Iterator[bytes]:
+        """Range GET against S3 (server-side slice, streamed in 64 KiB chunks)."""
+        from botocore.exceptions import ClientError
+
+        try:
+            obj = self._client.get_object(
+                Bucket=self._bucket, Key=self._full_key(key),
+                Range=f"bytes={max(0, start)}-{max(0, end)}",
+            )
+            body = obj["Body"]
+            while True:
+                chunk = body.read(65536)
+                if not chunk:
+                    break
+                yield chunk
+        except ClientError as exc:  # pragma: no cover
+            raise FileNotFoundError(key) from exc
+
     def delete(self, key: str) -> None:
         self._client.delete_object(Bucket=self._bucket, Key=self._full_key(key))
 
@@ -89,7 +117,9 @@ class S3CompatibleStorage(StorageProvider):
 
     def sign_get_url(self, key: str, expires_sec: int = 300) -> str:
         # App-relative path — the app proxies S3 bytes on verify; the bucket
-        # endpoint is never disclosed to the client.
+        # endpoint is never disclosed to the client. TTL capped like the local
+        # backend: a signed URL is a bearer credential, not a public link.
+        expires_sec = max(1, min(expires_sec, 3600))
         exp = int(time.time()) + expires_sec
         sig = self._sig(key, exp)
         return f"/api/video/{urllib.parse.quote(key, safe='')}?exp={exp}&sig={sig}"
@@ -99,7 +129,9 @@ class S3CompatibleStorage(StorageProvider):
             exp_i = int(exp)
         except ValueError:
             return False
-        if exp_i < int(time.time()):
+        now = int(time.time())
+        # Same skew + cap contract as the local backend (see comment there).
+        if exp_i < now or exp_i > now + 3600 + 60:
             return False
         expected = self._sig(key, exp_i)
         return hmac.compare_digest(expected, sig or "")
