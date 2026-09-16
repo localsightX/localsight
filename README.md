@@ -198,6 +198,10 @@ LocalSight is RTSP/ONVIF-native.
 - **Multi-vendor presets** — `GET /api/cameras/presets` includes Axis, Hanwha, Hikvision
   (ISAPI), Dahua (CGI), Reolink, Bosch, ONVIF, and GB/T 28181 templates. Use
   `POST /api/cameras/presets/build` to construct a URL (credentials are never echoed back).
+- **Remove a camera** — `DELETE /api/cameras/{id}` (or **Remove camera** on the camera's
+  dashboard page) deletes the camera and cascades its recordings, events, snapshots,
+  detections and tracks, stops its live transcode immediately, and the worker stops
+  ingesting within ~30 s. Audited, typed-confirm in the UI, gated on `camera:configure`.
 
 Cameras must be reachable from the server (isolated VLAN recommended). The SSRF guard
 blocks private/loopback/cloud-metadata destinations unless their CIDR is in

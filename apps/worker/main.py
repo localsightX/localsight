@@ -385,6 +385,26 @@ def persist_camera_status(rt, cid: str, st: str) -> None:
         log.warning("failed to persist status %s for %s: %s", st, cid, exc)
 
 
+def heartbeat_camera(rt, cid: str) -> bool:
+    """Touch `last_seen` while frames flow. Returns False when the camera row
+    is GONE — the caller treats that as "removed from the configuration" and
+    stops this camera's pipeline (frame loop + recorder).
+
+    A transient database error returns True (fail-safe): a DB blip must never
+    be mistaken for a deletion and kill a healthy camera's ingestion. The
+    worker snapshots cameras at startup, so this heartbeat is the ONLY path a
+    removal has into a running worker.
+    """
+    with contextlib.suppress(Exception), rt.SessionLocal() as s:
+        cam = s.get(Camera, cid)
+        if cam is None:
+            return False
+        if cam.status == "ONLINE":
+            cam.last_seen = timeutil.utcnow()
+            s.commit()
+    return True
+
+
 def run_camera(rt, camera: Camera, stop: threading.Event) -> None:
     settings = rt.settings
     try:
@@ -416,6 +436,14 @@ def run_camera(rt, camera: Camera, stop: threading.Event) -> None:
         motion_gate_enabled=settings.ai_motion_gate_enabled,
     )
 
+    # Per-camera stop event: set when this camera is removed from the
+    # configuration, so ITS recorder and frame loop wind down without touching
+    # sibling cameras. The global `stop` stays the process-wide signal.
+    cam_stop = threading.Event()
+
+    def _stopping() -> bool:
+        return stop.is_set() or cam_stop.is_set()
+
     # Main-stream recorder (only when a main URL is configured + recording on).
     recorder: Recorder | None = None
     main_url = camera.stream_url_enc
@@ -428,7 +456,9 @@ def run_camera(rt, camera: Camera, stop: threading.Event) -> None:
         )
 
         def _record_loop() -> None:
-            while not stop.is_set():
+            # Honors both the global stop and this camera's removal: a recorder
+            # must not keep cutting segments for a camera that is gone.
+            while not _stopping():
                 try:
                     recorder.record_url(plain_main, dt_now())  # row tracked internally
                     proc = recorder.last_proc
@@ -467,14 +497,6 @@ def run_camera(rt, camera: Camera, stop: threading.Event) -> None:
         metrics.set("camera_status", 1.0 if st == "ONLINE" else 0.0,
                     labels=f'camera="{cid}"')
 
-    def _heartbeat(cid: str) -> None:
-        """Touch last_seen while frames flow (between status transitions)."""
-        with contextlib.suppress(Exception), rt.SessionLocal() as s:
-            cam = s.get(Camera, cid)
-            if cam is not None and cam.status == "ONLINE":
-                cam.last_seen = timeutil.utcnow()
-                s.commit()
-
     gateway = StreamGateway(camera.id, make_source, on_status=_on_status)
     log.info("starting pipeline for camera %s (%s)", camera.id, camera.name)
 
@@ -485,13 +507,20 @@ def run_camera(rt, camera: Camera, stop: threading.Event) -> None:
     _last_heartbeat: float = 0.0
 
     for frame, ts in gateway.iter_frames():
-        if stop.is_set():
+        if _stopping():
             break
         # Bounded DB touch (≤1 per 30 s) so last_seen tracks liveness between
         # status transitions without turning the hot frame path into a
-        # per-frame DB write.
+        # per-frame DB write. The same touch is the removal signal: a camera
+        # deleted after the worker started reports itself here, and its
+        # pipeline winds down within one heartbeat instead of running — and
+        # recording — against a row that no longer exists.
         if time.time() - _last_heartbeat > 30.0:
-            _heartbeat(camera.id)
+            if not heartbeat_camera(rt, camera.id):
+                log.info("camera %s was removed from the configuration — stopping its pipeline",
+                         camera.id)
+                cam_stop.set()
+                break
             _last_heartbeat = time.time()
         t0 = time.perf_counter()
         session = rt.SessionLocal()

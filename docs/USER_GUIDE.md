@@ -21,6 +21,7 @@ see `AGENTS.md`; for operations (deployment, retention, troubleshooting) see
    - [The rules editor](#the-rules-editor)
    - [Behavior rules](#behavior-rules)
    - [Per-camera retention](#per-camera-retention)
+   - [Removing a camera](#removing-a-camera)
 4. [Live view](#live-view)
 5. [Overview (the NOC screen)](#overview-the-noc-screen)
 6. [Analytics](#analytics) — incl. [natural-language search](#natural-language-search)
@@ -206,6 +207,21 @@ Each camera can carry JSON rules evaluated per frame by the worker
 `{"days": 30}`) to override global policy for that camera's data. Global
 defaults: recordings 7 days, events 30 days, snapshots 14 days, embeddings
 90 days, audit 365 days.
+
+### Removing a camera
+
+On a camera's detail page, the **Remove this camera** card (requires the
+`camera:configure` permission) takes a camera out of the configuration:
+
+- **ingestion stops** — any live view of that camera stops immediately, and the
+  AI worker winds that camera's pipeline (frames + recording) down within ~30 s;
+- the camera's **recordings, events, snapshots, detections and tracks are
+  deleted**, and the recording/snapshot objects are removed from storage;
+- the action is **typed-confirm**: you must type the camera's exact name before
+  **Remove permanently** unlocks, and **Cancel** backs out without any API call;
+- the removal is **audited**, and the audit entry survives the removal.
+
+There is no undo — re-adding the same camera starts a fresh configuration.
 
 ## Live view
 
