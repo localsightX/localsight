@@ -204,6 +204,10 @@ class Track(Base):
     confidence: Mapped[float] = mapped_column(Float, default=0.0)
     bbox: Mapped[dict] = mapped_column(JSON)  # most recent
     trajectory: Mapped[list] = mapped_column(JSON, default=list)  # sampled centers
+    # Appearance/attribute tags sampled per track (CLIP zero-shot, non-biometric):
+    # {"jacket": true, "jacket_conf": 0.83, "color": "red", …}. JSON-safe and
+    # covered by the retention sweep alongside the track row.
+    detail: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 

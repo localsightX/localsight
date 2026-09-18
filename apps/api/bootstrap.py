@@ -61,6 +61,13 @@ def build(settings: Settings) -> Runtime:
         @event.listens_for(engine, "connect")
         def _fk_on(dbapi_connection, _record):  # pragma: no cover - trivial
             dbapi_connection.execute("PRAGMA foreign_keys=ON")
+            # Durability + concurrency: WAL lets API reads proceed while the
+            # worker commits events (no writer/reader blocking on the single
+            # file), and synchronous=NORMAL keeps commits durable across app
+            # crashes under WAL (only OS/power loss can lose the tail — the
+            # PostgreSQL backend is the production answer to that).
+            dbapi_connection.execute("PRAGMA journal_mode=WAL")
+            dbapi_connection.execute("PRAGMA synchronous=NORMAL")
     SessionLocal = sessionmaker(bind=engine, future=True)
 
     crypto = CryptoBox(settings.master_encryption_key)
@@ -126,6 +133,7 @@ def _ensure_columns(rt: Runtime) -> None:
         "ALTER TABLE cameras ADD COLUMN rules JSON",
         "ALTER TABLE alert_routes ADD COLUMN cooldown_sec INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE events ADD COLUMN detail JSON",
+        "ALTER TABLE tracks ADD COLUMN detail JSON",
     ]
     for stmt in added:
         try:
