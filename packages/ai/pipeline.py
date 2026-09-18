@@ -16,12 +16,12 @@ never logged.
 from __future__ import annotations
 
 import datetime as dt
-import hashlib
 import json
 
 from sqlalchemy import func, select
 
 from packages.ai.anpr import ANPRPipeline
+from packages.ai.attributes import AttributeTagger
 from packages.ai.interfaces import (
     Detector,
     FaceDetector,
@@ -52,6 +52,17 @@ _ENROLLED_TTL = 30.0  # seconds before re-checking enrolled embeddings
 # unbounded CPU + floods the event/alert store; we re-read at most this often and
 # only emit an event when the plate changes (new vehicle / new reading).
 _ANPR_INTERVAL_SEC = 5.0
+
+# Clothing-attribute sampling per person track ("jacket", colors, …): same
+# rationale as the ANPR throttle — per-frame CLIP on every person is unbounded
+# CPU, and clothing changes far slower than position. Re-tagged at most this
+# often per track, only when the crop can carry clothing signal.
+_ATTR_INTERVAL_SEC = 5.0
+_ATTR_MIN_BBOX_H = 0.08   # ≈29 px on a 360 px substream: below this, no signal
+# Faces need resolution too: below this bbox height a detected face would be
+# under ~24 px — too small for a usable ArcFace embedding. Skip the whole
+# SCRFD+embed call (the dominant per-track cost) instead of wasting it.
+_FACE_MIN_BBOX_H = 0.06
 
 # Detection rows are written only when the track actually moved (normalized
 # bbox delta beyond this epsilon) or when this many seconds elapsed since the
@@ -114,6 +125,7 @@ def _parse_mask(m: object) -> tuple[float, float, float, float] | None:
 
 class _TrackState:
     __slots__ = (
+        "attributes",
         "bbox",
         "confidence",
         "first_seen",
@@ -133,6 +145,7 @@ class _TrackState:
         self.seen_this_frame = True
         self.last_recognized: dt.datetime | None = None
         self.recognition: tuple[str | None, float | None, str] | None = None
+        self.attributes: dict | None = None
 
 
 class CameraPipeline:
@@ -154,6 +167,8 @@ class CameraPipeline:
         identity_recognition_enabled: bool = False,
         rule_engine: RuleEngine | None = None,
         anpr: ANPRPipeline | None = None,
+        attributes: AttributeTagger | None = None,
+        attribute_interval_sec: float = _ATTR_INTERVAL_SEC,
         privacy_masks: list[dict] | None = None,
         motion_gate_enabled: bool = False,
     ) -> None:
@@ -172,6 +187,8 @@ class CameraPipeline:
         self.recognition_enabled = bool(identity_recognition_enabled and face_chain and matcher)
         self.rule_engine = rule_engine
         self.anpr = anpr
+        self.attributes = attributes
+        self.attribute_interval = attribute_interval_sec
         self._masks = [m for m in (_parse_mask(x) for x in (privacy_masks or [])) if m]
         # Motion gate (AI_MOTION_GATE_ENABLED): skip detection on frames with
         # no pixel delta. Cheap frame-diff vs. running the full detector on a
@@ -179,6 +196,7 @@ class CameraPipeline:
         self.motion_gate_enabled = bool(motion_gate_enabled)
         self._gate_prev: bytes | None = None
         self._anpr_last: dict[str, tuple[str | None, dt.datetime]] = {}
+        self._attrs_last: dict[str, tuple[dt.datetime, dict]] = {}
         self._last_analytic: list[EventRow] = []  # point-in-time events (rules/anpr) for alerting
         # track_id -> ts of last DetectionRow persisted (write gating, F-04)
         self._detection_last_ts: dict[str, dt.datetime] = {}
@@ -324,9 +342,12 @@ class CameraPipeline:
                     bbox={"x": tr.bbox[0], "y": tr.bbox[1], "w": tr.bbox[2], "h": tr.bbox[3]},
                     detail={
                         "plate_enc": self.crypto.encrypt_str(reading.plate),
-                        "plate_hash": hashlib.sha256(
-                            reading.plate.encode("utf-8")
-                        ).hexdigest()[:16],
+                        # Keyed HMAC (CryptoBox.hmac_str), NOT bare SHA-256:
+                        # plates are a ~36^8 keyspace — an unkeyed hash is
+                        # brute-forceable offline. The master-key-bound token
+                        # stays a searchable equality index that an attacker
+                        # with a stolen DB cannot invert.
+                        "plate_hash": self.crypto.hmac_str(reading.plate),
                     },
                 )
                 session.add(ev)
@@ -342,7 +363,24 @@ class CameraPipeline:
             st.bbox = tr.bbox
             st.confidence = max(st.confidence, tr.confidence)
 
-            if self.recognition_enabled and self._should_recognize(st, ts):
+            # Clothing attributes (opt-in tagger): sampled per TRACK, only for
+            # persons whose crop is large enough to carry clothing signal.
+            # Re-tag at most every attribute_interval seconds; last tag wins.
+            if (self.attributes is not None and tr.label == "person"
+                    and tr.bbox[3] >= _ATTR_MIN_BBOX_H):
+                last_ts, _ = self._attrs_last.get(tr.track_id, (None, None))
+                if last_ts is None or (ts - last_ts).total_seconds() >= self.attribute_interval:
+                    tags = self.attributes.tag(_crop_vehicle(frame, tr.bbox))
+                    self._attrs_last[tr.track_id] = (ts, tags)
+                    if tags:
+                        st.attributes = tags
+
+            # Face recognition: the far-field gate skips the whole
+            # SCRFD+embed chain when the person is too small for a usable
+            # embedding (~24 px face). last_recognized is NOT advanced, so
+            # recognition retries automatically as the person approaches.
+            if (self.recognition_enabled and tr.bbox[3] >= _FACE_MIN_BBOX_H
+                    and self._should_recognize(st, ts)):
                 st.last_recognized = ts
                 rec = self._recognize(frame, tr)
                 st.recognition = (rec.person_id, rec.similarity, rec.status)
@@ -385,6 +423,12 @@ class CameraPipeline:
             if tid not in active_ids:
                 self._detection_last_ts.pop(tid, None)
                 self._detection_last_bbox.pop(tid, None)
+        for tid in list(self._attrs_last):
+            if tid not in active_ids:
+                self._attrs_last.pop(tid, None)
+        for tid in list(self._anpr_last):
+            if tid not in active_ids:
+                self._anpr_last.pop(tid, None)
 
         # close stale tracks -> events
         for tid, st in list(self._active.items()):
@@ -426,6 +470,9 @@ class CameraPipeline:
             timestamp_end=st.last_seen,
             confidence=st.confidence,
             bbox={"x": st.bbox[0], "y": st.bbox[1], "w": st.bbox[2], "h": st.bbox[3]},
+            # Non-biometric appearance context rides with the presence event
+            # (search: "person in red jacket"); None when never tagged.
+            detail={"attributes": st.attributes} if st.attributes else None,
         )
         session.add(event)
         session.flush()  # populate event.id
@@ -454,3 +501,4 @@ class CameraPipeline:
             row.confidence = st.confidence
             row.bbox = {"x": st.bbox[0], "y": st.bbox[1], "w": st.bbox[2], "h": st.bbox[3]}
             row.trajectory = st.trajectory
+            row.detail = st.attributes or None
