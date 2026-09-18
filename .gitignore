@@ -40,3 +40,4 @@ infrastructure/nginx/certs/
 *.crt
 infrastructure/compose/demo.env
 .buildx/
+roadmap/
