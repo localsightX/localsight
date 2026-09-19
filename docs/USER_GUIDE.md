@@ -31,6 +31,7 @@ see `AGENTS.md`; for operations (deployment, retention, troubleshooting) see
 10. [Keyboard shortcuts](#keyboard-shortcuts)
 11. [Density](#density)
 12. [Events, search & clips](#events-search--clips)
+    - [Forensic search — attributes, plates, saved searches](#forensic-search-attributes-plates-saved-searches)
 13. [Alerts](#alerts) — incl. the [Alerts screen](#the-alerts-screen-wave-3)
 14. [People & enrollment](#people--enrollment) — incl. the
     [Identities screen](#the-identities-screen-wave-3)
@@ -321,6 +322,24 @@ clocks that could mean two wall-times to two people.
 
 The **Audit** view additionally filters by user, action, result and a
 date window, and paginates — compliance review no longer means scrolling.
+
+## Forensic search — attributes, plates, saved searches
+
+The **Events** view carries a **Forensic search** card (visible to every
+role; saving needs a role with `search:save`):
+
+- **Attributes** — search the AI's clothing tags on tracks: type a key
+  (`jacket`, `color`, `hat`…) and optionally a value (`red`). Every hit
+  shows the camera, time and the tags, and "Show in events" jumps to that
+  camera's feed so you land in the surrounding footage.
+- **Plate** — type a plate exactly as it reads (`ab-12 cd` is fine); the
+  lookup normalizes it (`AB12CD`) and finds every ANPR sighting. Plates are
+  stored encrypted and matched through a keyed hash, so the console never
+  shows plate material — only *where* and *when* it was seen. Partial
+  plates are not searchable by design; use the event feed for those.
+- **Saved searches** — name the current search and **Save**; it appears as
+  a chip above the results (click to re-run, ✕ to delete). Saving and
+  deleting are audit-logged; every user sees only their own searches.
 
 ## Your account (M2)
 

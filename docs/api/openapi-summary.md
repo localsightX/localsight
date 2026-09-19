@@ -77,11 +77,48 @@ curl -X POST http://localhost:8000/api/persons/$ID/references \
 | GET | `/api/timeline?date=&camera_id=` | `events:view` (merged recording intervals + presence + markers) |
 | GET | `/api/events` (filtered) | `events:view` |
 | GET | `/api/alerts/events` | `events:view` (includes `detail` context per event) |
+| GET | `/api/search/attributes?key=&value=&camera_id=&start=&end=` | `search:view` (B1: CLIP tags on tracks) |
+| GET | `/api/search/plates?q=&camera_id=&start=&end=` | `search:view` (B2: exact keyed-HMAC plate match) |
+| GET | `/api/searches` | `search:view` (caller's saved searches) |
+| POST | `/api/searches` | `search:save` (audited) |
+| DELETE | `/api/searches/{id}` | `search:save` (audited, owner-only) |
 
 Event rows carry a `detail` JSON column: rule events include `direction`,
 `dwell_sec`, `count`, `zone`; ANPR events include `plate_enc` (envelope-
 encrypted plate — decryptable only on the host) and `plate_hash` (anonymized
 correlation digest).
+
+### Use case: Find a person wearing a red jacket (attribute search)
+```bash
+curl "http://localhost:8000/api/search/attributes?key=color&value=red&camera_id=$CAM" \
+  -H "Authorization: Bearer $TOKEN"
+# => {"query": {"key": "color", "value": "red"}, "results": [
+#      {"track_id": "cam-01-track-1842", "camera_id": "...", "identity_status": "unknown",
+#       "last_seen": "2026-09-19T14:02:11Z+00:00", "matched": {"color": "red"},
+#       "attributes": {"jacket": true, "color": "red", "jacket_conf": 0.83}}]}
+# Searches the Track.detail CLIP tags; omit `value` for has-key semantics.
+```
+
+### Use case: Look up a plate (exact match over the keyed HMAC index)
+```bash
+curl "http://localhost:8000/api/search/plates?q=ab-12%20cd" \
+  -H "Authorization: Bearer $TOKEN"
+# => {"query": {"plate": "AB12CD"}, "results": [{"event_id": "...", "camera_id": "...",
+#      "ts": "...", "confidence": 0.94}]}
+# Input is normalized exactly like the OCR pipeline (uppercase, [A-Z0-9]) and
+# matched against the master-key HMAC tokens — plaintext plates are never
+# stored, returned, or searched. Partial plates are not searchable by design.
+```
+
+### Use case: Save a forensic search for the team shift (audited)
+```bash
+curl -X POST http://localhost:8000/api/searches \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"name": "red jackets front gate", "kind": "attributes", "params": {"key": "color", "value": "red"}}'
+# Saved per user (quota 50, unique name, payload ≤ 2 KB); GET /api/searches lists
+# the caller's own searches, DELETE removes one. Save and delete are audit-logged.
+```
+
 
 ### Use case: Search events by camera and time range
 ```bash

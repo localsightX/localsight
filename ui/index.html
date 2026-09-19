@@ -132,6 +132,24 @@
             <button id="ev-next" class="ghost" aria-label="Next page">Next →</button>
           </div>
         </div>
+
+        <div class="card hidden" id="fs-card" aria-label="Forensic search">
+          <div class="panel-head"><h2>Forensic search</h2></div>
+          <div class="toolbar">
+            <select id="fs-kind" aria-label="Search type">
+              <option value="attributes">Attributes (jacket, color…)</option>
+              <option value="plates">Plate</option>
+            </select>
+            <input id="fs-key" class="mono" placeholder="Attribute — jacket, color…" aria-label="Attribute key" />
+            <input id="fs-value" class="mono" placeholder="Value — red, true…" aria-label="Attribute value" />
+            <input id="fs-plate" class="mono hidden" placeholder="Plate — AB12CD" aria-label="Plate text" maxlength="16" />
+            <button id="fs-run" class="primary">Find</button>
+            <input id="fs-save-name" class="mono" placeholder="Save this search as…" aria-label="Saved search name" maxlength="120" />
+            <button id="fs-save" class="ghost" title="Save this search — audited">Save</button>
+          </div>
+          <div id="fs-saved" class="chip-row" role="list" aria-label="Saved searches"></div>
+          <div id="fs-results" aria-live="polite"></div>
+        </div>
       </section>
 
       <section data-panel="timeline" class="panel hidden" aria-label="Timeline">

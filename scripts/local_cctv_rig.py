@@ -21,6 +21,7 @@ Commands:
     start    boot the full rig (idempotent pieces; --source camera|synthetic)
     status   show process + stream + API health
     verify   programmatic end-to-end checks (prints PASS/FAIL per stage)
+    bench    detector latency budgets — R1 exit gate (PASS/FAIL + exit code)
     stop     terminate everything the rig started
     watch    tail combined rig logs live (Ctrl-C to detach)
 
@@ -658,6 +659,25 @@ def cmd_watch() -> None:
     os.execvp("tail", ["tail", "-n", "20", "-F", *existing])  # noqa: S606
 
 
+def cmd_bench(backend: str, iterations: int) -> int:
+    """Run the detector latency bench with the rig's own env (R1 exit gate).
+
+    Runs as a subprocess so the rig's staged-model env (AI_DETECTOR,
+    AI_MODEL_NAME, regression allowlist) applies exactly as the worker sees it
+    — benchmarking a differently configured interpreter would measure a
+    deployment nobody runs. Exit code is the bench's own pass/fail, so the
+    command is usable directly in CI or a pre-demo check.
+    """
+    if not os.path.exists(os.path.join(RIG_DIR, "env")):
+        die("rig env not found — run `setup`/`start` first")
+    print(f"bench: backend={backend} iterations={iterations}")
+    cmd = [sys.executable, os.path.join(REPO, "scripts", "bench_detector.py"),
+           "--backend", backend, "--iterations", str(iterations)]
+    proc = subprocess.run(cmd, cwd=REPO)  # noqa: S603 - fixed argv, our own script
+    print("bench report rendered above; exit code carries the budget verdict.")
+    return proc.returncode
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -669,6 +689,11 @@ def main() -> int:
                          help="FaceTime camera or synthetic moving pattern")
     sub.add_parser("status", help="process/stream/API health")
     sub.add_parser("verify", help="end-to-end checks")
+    p_bench = sub.add_parser("bench", help="detector latency budgets (R1 exit gate)")
+    p_bench.add_argument("--backend", default="onnx",
+                         choices=["none", "onnx", "openvino", "tensorrt"],
+                         help="none = pure hot paths only, no staged model needed")
+    p_bench.add_argument("--iterations", type=int, default=100)
     sub.add_parser("stop", help="tear the rig down")
     sub.add_parser("watch", help="tail all rig logs")
     args = ap.parse_args()
@@ -681,6 +706,8 @@ def main() -> int:
         cmd_status()
     elif args.cmd == "verify":
         return cmd_verify()
+    elif args.cmd == "bench":
+        return cmd_bench(args.backend, args.iterations)
     elif args.cmd == "stop":
         cmd_stop()
     elif args.cmd == "watch":

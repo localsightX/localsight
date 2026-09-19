@@ -354,3 +354,58 @@ def test_admin_revokes_all_user_sessions(client, admin_auth):
     assert r.status_code == 200
     assert r.json()["revoked"] >= 1
     assert client.post("/api/auth/refresh", json={"refresh_token": tok}).status_code == 401
+
+
+# ── R2 forensic search: saved searches (B8) ─────────────────────────────────
+def test_saved_search_crud_and_quota_rules(client, admin_auth):
+    body = {"name": "red jacket", "kind": "attributes",
+            "params": {"key": "color", "value": "red"}}
+    r = client.post("/api/searches", headers=admin_auth, json=body)
+    assert r.status_code == 201, r.text
+    sid = r.json()["id"]
+
+    items = client.get("/api/searches", headers=admin_auth).json()["items"]
+    assert any(i["id"] == sid and i["kind"] == "attributes" for i in items)
+
+    # duplicate name → 409; bad kind → 422; oversized payload → 422
+    assert client.post("/api/searches", headers=admin_auth, json=body).status_code == 409
+    bad = {"name": "x", "kind": "plates", "params": {"blob": "x" * 3000}}
+    assert client.post("/api/searches", headers=admin_auth, json=bad).status_code == 422
+    assert client.post("/api/searches", headers=admin_auth,
+                       json={"name": "y", "kind": "nope", "params": {}}).status_code == 422
+
+    assert client.delete(f"/api/searches/{sid}", headers=admin_auth).status_code == 200
+    assert client.delete(f"/api/searches/{sid}", headers=admin_auth).status_code == 404
+
+
+def test_saved_searches_are_private_per_user(client, admin_auth, viewer_auth):
+    """Ownership boundary: permission gate first (VIEWER 403), then ownership
+    (a entitled user never touches another's saved search -> 404)."""
+    r = client.post("/api/searches", headers=admin_auth,
+                    json={"name": "admin only", "kind": "plates", "params": {"q": "AB12CD"}})
+    sid = r.json()["id"]
+    assert client.get("/api/searches", headers=viewer_auth).json()["items"] == []
+    # VIEWER lacks search:save entirely -> permission gate, not ownership
+    assert client.post("/api/searches", headers=viewer_auth,
+                       json={"name": "v", "kind": "text", "params": {}}).status_code == 403
+    assert client.delete(f"/api/searches/{sid}", headers=viewer_auth).status_code == 403
+
+    # an entitled second user (ANALYST has search:save) gets 404, not the row
+    client.post("/api/users", json={"email": "analyst@test.com", "password": "AnalystPw12345",
+                                    "role": "ANALYST"}, headers=_admin(client))
+    analyst = client.post("/api/auth/login",
+                          json={"email": "analyst@test.com", "password": "AnalystPw12345"}).json()
+    ah = {"Authorization": f"Bearer {analyst['access_token']}"}
+    assert client.get("/api/searches", headers=ah).json()["items"] == []
+    assert client.delete(f"/api/searches/{sid}", headers=ah).status_code == 404
+    assert client.delete(f"/api/searches/{sid}", headers=admin_auth).status_code == 200
+
+
+def test_saved_search_lifecycle_is_audited(client, admin_auth):
+    client.post("/api/searches", headers=admin_auth,
+                json={"name": "audited", "kind": "text", "params": {"q": "loitering"}})
+    items = client.get("/api/audit", params={"action": "search.save"},
+                       headers=admin_auth).json()
+    rows = items.get("items", items) if isinstance(items, dict) else items
+    assert any("saved_search" in str(a.get("resource", "")) for a in rows), rows
+

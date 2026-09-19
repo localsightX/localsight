@@ -288,6 +288,52 @@ quantize_dynamic(
 Typically 2-2.5x speedup with < 1% mAP drop. Update the registry entry with
 the new file path and hash.
 
+Record the artifact as quantized so the bench report and the registry are
+self-describing (never infer quantization from a filename):
+
+```bash
+python scripts/stage_model.py --name detector_int8 \
+    --path models/staged/yolo11n_int8.onnx \
+    --source "operator INT8 export of yolo11n-detect.onnx" \
+    --license "AGPL-3.0 (Ultralytics YOLO11n, COCO-pretrained)" \
+    --quantized
+```
+
+Then select it with `AI_MODEL_NAME=detector_int8`. For static-shape INT8,
+export with a fixed 1x3x384x640 input (`onnxruntime.quantization.
+quantize_static` + a small calibration set of frames from the target cameras)
+— dynamic quantization is the pragmatic default, static is the fastest.
+
+### Choosing between YOLO11n and YOLO26n
+
+Both are staged the same way; only the upstream export differs.
+
+```bash
+# Operator-side export (their AGPL duty, their choice of runner), then:
+python scripts/stage_model.py --name detector_yolo26 \
+    --path models/staged/yolo26n.onnx \
+    --source "https://github.com/ultralytics/assets (yolo26n export)" \
+    --license "AGPL-3.0 (Ultralytics YOLO26n, COCO-pretrained)"
+# AI_MODEL_NAME=detector_yolo26
+```
+
+Notes that matter in this codebase:
+
+- **Export `nms=False`** (YOLO26's end-to-end head). The decoder in
+  `packages/ai/detectors.py` detects the `(batch, max_det, 6)` layout and uses
+  `postprocess_yolo_e2e` (no NMS pass, FP32-safe class ids) — measurably the
+  cheapest decode we measure (`e2e_decode_ms` in the bench report).
+- A classic `nms=True` export still works: both the row-major and the
+  transposed v8/v11/v26 heads are auto-detected and decoded by
+  `postprocess_yolo`.
+- YOLO26n is the better default for CPU-only edge boxes (reported ~40 % faster
+  CPU latency than YOLO11n at equal or better COCO mAP) and its STAL label
+  assignment improves small/far-field objects — the long-corridor case where a
+  640×360 substream is weakest.
+- Model weights are **not** committed to this repository: they are
+  operator-staged and hash-verified (AGPL-3.0 covered — see the license table
+  at the top of this document).
+
 ### Reverting to the reference detector
 
 If the ONNX model is misbehaving or you want to test without GPU, set:

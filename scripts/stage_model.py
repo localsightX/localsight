@@ -47,6 +47,10 @@ def main() -> int:
     ap.add_argument("--version", default="latest")
     ap.add_argument("--source", default="", help="provenance (where it came from)")
     ap.add_argument("--license", default="", help="artifact license (SPDX-ish)")
+    ap.add_argument("--task", default="detect",
+                    help="model task: detect | classify | embed | ocr | pose | prompts")
+    ap.add_argument("--quantized", action="store_true",
+                    help="artifact is INT8/FP16 post-training-quantized")
     args = ap.parse_args()
 
     path = Path(args.path)
@@ -62,6 +66,8 @@ def main() -> int:
         "hash_sha256": digest,
         "source": args.source,
         "license": args.license,
+        "task": args.task,
+        "quantized": bool(args.quantized),
     }
 
     data = {"models": []}

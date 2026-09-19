@@ -24,6 +24,10 @@ PERMISSIONS: set[str] = {
     "alerts:manage",
     "analytics:view",
     "live:view",
+    # R2 forensic search (B1/B2/B5/B8): attribute + plate + natural-language
+    # lookup over stored events/tracks, and saving those lookups for reuse.
+    "search:view",
+    "search:save",
 }
 
 # Role -> permission set.
@@ -45,6 +49,8 @@ ROLE_PERMISSIONS: dict[str, set[str]] = {
         "alerts:manage",
         "analytics:view",
         "live:view",
+        "search:view",
+        "search:save",
     },
     "ANALYST": {
         "camera:view",
@@ -55,6 +61,8 @@ ROLE_PERMISSIONS: dict[str, set[str]] = {
         "audit:view",
         "analytics:view",
         "live:view",
+        "search:view",
+        "search:save",
     },
     "VIEWER": {
         "camera:view",
@@ -63,6 +71,7 @@ ROLE_PERMISSIONS: dict[str, set[str]] = {
         "events:view",
         "analytics:view",
         "live:view",
+        "search:view",
     },
 }
 

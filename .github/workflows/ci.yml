@@ -104,6 +104,14 @@ jobs:
           # job with browser dependencies — keep this job fast and hermetic.
           pytest tests/ -v --tb=short -m "not ui" --cov=packages --cov=apps --cov-report=xml --cov-fail-under=50
 
+      # R1 latency gate: the pure hot paths are timed with no staged model, so
+      # this is deterministic on a CPU runner. Budgets live in
+      # packages/ai/bench.py (motion gate, YOLO post-process, NMS-free decode);
+      # a regression that trades latency for features fails here instead of in
+      # a customer's control room.
+      - name: Latency budget gate (R1)
+        run: python scripts/bench_detector.py --backend none --iterations 60
+
       - name: Upload coverage to Codecov
         if: github.event_name == 'pull_request'
         uses: codecov/codecov-action@v4
