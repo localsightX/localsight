@@ -290,6 +290,26 @@ class SystemMetric(Base):
     tags: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
 
+class SavedSearch(Base):
+    """A user's named, re-runnable forensic query (R2/B8).
+
+    User configuration, not surveillance data: rows cascade away with their
+    owner (FK ondelete=CASCADE) and carry no media or PII — `params` holds
+    only the query inputs (attribute key/value, plate, time window), bounded
+    at the API layer. Name is unique per owner; the save/delete lifecycle is
+    audit-logged in apps.api.routers.search.
+    """
+    __tablename__ = "saved_searches"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    name: Mapped[str] = mapped_column(String(120))
+    kind: Mapped[str] = mapped_column(String(16))  # attributes | plates | text
+    params: Mapped[dict] = mapped_column(JSON)
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (UniqueConstraint("user_id", "name", name="uq_saved_search_user_name"),)
+
+
 class ModelVersion(Base):
     __tablename__ = "model_versions"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)

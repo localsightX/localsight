@@ -27,6 +27,7 @@ from apps.api.routers import (
     cameras,
     events,
     persons,
+    search,
     system,
     timeline,
     users,
@@ -97,6 +98,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(system.router)
     app.include_router(alerts.router)
     app.include_router(analytics.router)
+    app.include_router(search.router)
     app.include_router(live.router)
     app.include_router(rules.router)
 

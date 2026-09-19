@@ -3008,3 +3008,79 @@ def _viewer(client):
                 headers={"Authorization": _admin(client)})
     r = client.post("/api/auth/login", json={"email": "viewer@test.com", "password": "ViewerPw12345"})
     return f"Bearer {r.json()['access_token']}"
+
+
+# ── R2 forensic search: attribute + plate lookups (B1/B2) ───────────────────
+def _mk_camera(client, name):
+    h = {"Authorization": _admin(client)}
+    return client.post("/api/cameras", json={"name": name}, headers=h).json()["id"]
+
+
+def test_forensic_attribute_search_finds_tagged_track(client):
+    """B1: Track.detail CLIP tags are searchable; untagged/mismatched are not."""
+    cam = _mk_camera(client, "cam-attr")
+    now = dt.datetime.now(dt.UTC)
+    with client.app.state.runtime.SessionLocal() as s:
+        s.add(Track(id="cam-01-track-1", camera_id=cam, first_seen=now, last_seen=now,
+                    confidence=0.91, bbox={"x": 0.1, "y": 0.1, "w": 0.2, "h": 0.5},
+                    detail={"jacket": True, "color": "red", "jacket_conf": 0.83}))
+        s.add(Track(id="cam-01-track-2", camera_id=cam, first_seen=now, last_seen=now,
+                    confidence=0.8, bbox={"x": 0.1, "y": 0.1, "w": 0.2, "h": 0.5},
+                    detail={"jacket": True, "color": "blue"}))
+        s.add(Track(id="cam-01-track-3", camera_id=cam, first_seen=now, last_seen=now,
+                    confidence=0.7, bbox={"x": 0.1, "y": 0.1, "w": 0.2, "h": 0.5}))
+        s.commit()
+
+    h = {"Authorization": _admin(client)}
+    r = client.get("/api/search/attributes",
+                   params={"key": "color", "value": "red", "camera_id": cam}, headers=h)
+    assert r.status_code == 200, r.text
+    hits = r.json()["results"]
+    assert len(hits) == 1 and hits[0]["track_id"] == "cam-01-track-1"
+    assert hits[0]["matched"] == {"color": "red"}
+
+    # has-key semantics: no value -> every track carrying the key
+    r = client.get("/api/search/attributes",
+                   params={"key": "jacket", "camera_id": cam}, headers=h)
+    assert {x["track_id"] for x in r.json()["results"]} == {"cam-01-track-1", "cam-01-track-2"}
+
+    # camera scoping excludes other cameras entirely
+    other = _mk_camera(client, "cam-attr-other")
+    r = client.get("/api/search/attributes",
+                   params={"key": "color", "value": "red", "camera_id": other}, headers=h)
+    assert r.json()["results"] == []
+
+
+def test_forensic_plate_search_uses_keyed_hmac(client):
+    """B2: exact match over CryptoBox.hmac_str tokens; normalization mirrors
+    packages.ai.anpr; responses never carry plate material."""
+    rt = client.app.state.runtime
+    cam = _mk_camera(client, "cam-lpr")
+    now = dt.datetime.now(dt.UTC)
+    with rt.SessionLocal() as s:
+        s.add(Event(camera_id=cam, event_type="anpr", identity_status="unknown",
+                    timestamp_start=now, timestamp_end=now, confidence=0.94,
+                    bbox={"x": 0.1, "y": 0.1, "w": 0.3, "h": 0.1},
+                    detail={"plate_enc": "ct", "plate_hash": rt.crypto.hmac_str("AB12CD")}))
+        s.add(Event(camera_id=cam, event_type="anpr", identity_status="unknown",
+                    timestamp_start=now, timestamp_end=now, confidence=0.9,
+                    bbox={"x": 0.1, "y": 0.1, "w": 0.3, "h": 0.1},
+                    detail={"plate_enc": "ct2", "plate_hash": rt.crypto.hmac_str("XY99ZZ")}))
+        s.commit()
+
+    h = {"Authorization": _admin(client)}
+    # messy operator input normalizes to the same token the pipeline wrote
+    r = client.get("/api/search/plates", params={"q": "ab-12 cd", "camera_id": cam}, headers=h)
+    assert r.status_code == 200, r.text
+    hits = r.json()["results"]
+    assert len(hits) == 1 and hits[0]["track_id"] is None
+    assert "plate" not in hits[0] and "plate_enc" not in hits[0]  # no plate material out
+    assert r.json()["query"]["plate"] == "AB12CD"
+
+    # normalized miss -> empty, not error
+    r = client.get("/api/search/plates", params={"q": "ZZZ999", "camera_id": cam}, headers=h)
+    assert r.status_code == 200 and r.json()["results"] == []
+
+    # validation: pattern rejects input outside the allowed alphabet
+    assert client.get("/api/search/plates", params={"q": "!!"}, headers=h).status_code == 422
+

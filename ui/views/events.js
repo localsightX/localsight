@@ -192,6 +192,175 @@ function paintBulkBar() {
   if (n) n.textContent = String(selected.size);
 }
 
+// ── R2 forensic search (B1 attributes / B2 plates / B8 saved) ───────────────
+// The card is investigative, so it's permission-gated (`search:view`; saving
+// needs `search:save`) and every save/delete is audited server-side. Results
+// never carry plate material — the plate tab shows *where*, not *what*.
+
+function fsKind() {
+  const el = document.getElementById("fs-kind");
+  return el ? el.value : "attributes";
+}
+
+function fsToggleKind() {
+  const kind = fsKind();
+  document.getElementById("fs-key").classList.toggle("hidden", kind !== "attributes");
+  document.getElementById("fs-value").classList.toggle("hidden", kind !== "attributes");
+  document.getElementById("fs-plate").classList.toggle("hidden", kind !== "plates");
+}
+
+function fsParams() {
+  const camera = document.getElementById("ev-camera").value.trim();
+  if (fsKind() === "plates") {
+    return { kind: "plates", q: document.getElementById("fs-plate").value.trim(), camera };
+  }
+  return {
+    kind: "attributes",
+    key: document.getElementById("fs-key").value.trim(),
+    value: document.getElementById("fs-value").value.trim(),
+    camera,
+  };
+}
+
+function fsResultRow(r, kind, nameMap) {
+  const camName = nameMap.get(r.camera_id) || `camera ${shortId(r.camera_id)}`;
+  const when = r.ts || r.last_seen || "";
+  const action = h("button", {
+    class: "ghost linklike",
+    onClick: () => {
+      if (kind === "plates" && r.event_id) { openEvent(r.event_id); return; }
+      // attribute hit: scope the event list to that camera so the operator
+      // lands in the surrounding footage instead of a dead end
+      const cam = document.getElementById("ev-camera");
+      if (cam) cam.value = r.camera_id;
+      document.getElementById("ev-search").click();
+    },
+  }, kind === "plates" ? "Open event" : "Show in events");
+  const attrCell = kind === "plates"
+    ? h("td", { class: "mono" }, Number.isFinite(r.confidence) ? r.confidence.toFixed(2) : "—")
+    : h("td", {}, Object.entries(r.attributes || {})
+        .filter(([k]) => !k.endsWith("_conf"))
+        .map(([k, v]) => h("span", { class: "chip" }, `${k}: ${v === true ? "yes" : String(v)}`)));
+  return h("tr", {},
+    h("td", {}, camName),
+    h("td", { class: "mono" }, when ? fmtDateTime(when) : "—"),
+    attrCell,
+    h("td", {}, action),
+  );
+}
+
+async function runForensic() {
+  const out = document.getElementById("fs-results");
+  if (!out) return;
+  const { kind, q, key, value, camera } = fsParams();
+  if (kind === "plates" ? !q : !key) {
+    render(out, emptyState({
+      icon: "⌕", title: "Nothing to search yet",
+      hint: kind === "plates"
+        ? "Type a plate — spaces and dashes are normalized for you."
+        : "Type an attribute, e.g. jacket or color.",
+    }));
+    return;
+  }
+  skeletonRows(out, 4);
+  const qs = new URLSearchParams();
+  if (kind === "plates") qs.set("q", q);
+  else { qs.set("key", key); if (value) qs.set("value", value); }
+  if (camera) qs.set("camera_id", camera);
+  try {
+    const [data, nameMap] = await Promise.all([
+      api(`/api/search/${kind === "plates" ? "plates" : "attributes"}?${qs}`),
+      names(),
+    ]);
+    const items = data.results || [];
+    render(out, items.length
+      ? h("div", { class: "table-scroll" },
+          h("table", {},
+            h("thead", {}, h("tr", {},
+              h("th", { scope: "col" }, "Camera"),
+              h("th", { scope: "col" }, "When"),
+              h("th", { scope: "col" }, kind === "plates" ? "Confidence" : "Attributes"),
+              h("th", { scope: "col" }, ""),
+            )),
+            h("tbody", {}, items.map((r) => fsResultRow(r, kind, nameMap))),
+          ))
+      : emptyState({
+          icon: "◌", title: "No matches",
+          hint: "Widen the window (clear the camera filter), or check the spelling — plate search is exact by design.",
+        }));
+  } catch (err) {
+    render(out, errorState(err, { noun: "search", onRetry: runForensic }));
+  }
+}
+
+let savedSearches = [];
+
+async function loadSaved() {
+  const wrap = document.getElementById("fs-saved");
+  if (!wrap) return;
+  try {
+    savedSearches = (await api("/api/searches")).items || [];
+  } catch {
+    savedSearches = []; // card keeps working even if the listing fails
+  }
+  render(wrap, savedSearches.map((s) => h("span", { class: "chip", role: "listitem" },
+    h("button", {
+      class: "ghost linklike", title: "Run this saved search",
+      onClick: () => applySaved(s),
+    }, s.name),
+    h("button", {
+      class: "ghost linklike", "aria-label": `Delete saved search ${s.name}`,
+      onClick: async () => {
+        try {
+          await api(`/api/searches/${s.id}`, { method: "DELETE" });
+          toast("Saved search deleted", { tone: "ok" });
+          loadSaved();
+        } catch (err) {
+          toast(err.status === 403 ? "Your role can't manage saved searches"
+            : "Delete failed — try again", { tone: "error" });
+        }
+      },
+    }, "✕"),
+  )));
+}
+
+function applySaved(s) {
+  const p = s.params || {};
+  document.getElementById("fs-kind").value = s.kind;
+  fsToggleKind();
+  if (s.kind === "plates") document.getElementById("fs-plate").value = p.q || "";
+  else {
+    document.getElementById("fs-key").value = p.key || "";
+    document.getElementById("fs-value").value = p.value || "";
+  }
+  runForensic();
+}
+
+async function saveCurrent() {
+  const nameEl = document.getElementById("fs-save-name");
+  const name = (nameEl.value || "").trim();
+  const { kind, q, key, value } = fsParams();
+  if (!name) { toast("Name the search before saving", { tone: "warn" }); nameEl.focus(); return; }
+  const params = kind === "plates" ? { q } : { key, value };
+  const btn = document.getElementById("fs-save");
+  btn.disabled = true;
+  try {
+    await api("/api/searches", {
+      method: "POST",
+      body: JSON.stringify({ name, kind, params }),
+    });
+    nameEl.value = "";
+    toast(`Saved “${name}” — find it in the chips above`, { tone: "ok" });
+    loadSaved();
+  } catch (err) {
+    toast(err.status === 409 ? "A saved search with that name exists"
+      : err.status === 403 ? "Your role can't save searches"
+      : "Save failed — try again", { tone: "error" });
+  } finally {
+    btn.disabled = false;
+  }
+}
+
 export function wireEventsView(wrapEl) {
   listWrap = wrapEl;
   document.getElementById("ev-search").addEventListener("click", () => {
@@ -295,6 +464,25 @@ export function wireEventsView(wrapEl) {
     offset = Math.max(0, offset - PAGE);
     loadEvents(wrapEl);
   });
+
+  // ── R2 forensic search card (B1/B2/B8) — gated per role; can() is live by
+  // wire time (same guarantee the export gate above relies on).
+  const fsCard = document.getElementById("fs-card");
+  if (fsCard) {
+    const entitled = can("search:view");
+    fsCard.classList.toggle("hidden", !entitled);
+    if (entitled) {
+      const canSave = can("search:save");
+      const saveBtn = document.getElementById("fs-save");
+      const nameIn = document.getElementById("fs-save-name");
+      saveBtn.classList.toggle("hidden", !canSave);
+      nameIn.classList.toggle("hidden", !canSave);
+      document.getElementById("fs-kind").addEventListener("change", fsToggleKind);
+      document.getElementById("fs-run").addEventListener("click", runForensic);
+      if (canSave) saveBtn.addEventListener("click", saveCurrent);
+      loadSaved();
+    }
+  }
   document.getElementById("ev-next").addEventListener("click", () => {
     offset += PAGE;
     loadEvents(wrapEl);
