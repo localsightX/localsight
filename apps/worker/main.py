@@ -43,6 +43,7 @@ from packages.domain.models import (
     VideoSegment,
 )
 from packages.notify import Alert, PushNotifier, WebhookNotifier, build_notifier, dispatch
+from packages.observability import disk
 from packages.observability.logging import configure_logging, logging
 from packages.observability.metrics import metrics
 from packages.security.errors import UnsafeUrlError
@@ -168,12 +169,77 @@ def _alert_sender(rt, stop: threading.Event) -> None:
 
 
 def _retention_loop(rt, stop: threading.Event) -> None:
+    monitor = make_disk_monitor(rt)
     while not stop.is_set():
         try:
             _sweep_retention(rt)
         except Exception as exc:
             log.warning("retention sweep failed: %s", exc)
+        # Disk pressure is checked on the same hourly cadence as the sweep that
+        # reclaims the space (reliability plan F3). A failing check must never
+        # kill the loop — the alarm is the last line of defence, not a
+        # replacement for retention.
+        try:
+            _check_disk_pressure(rt, monitor)
+        except Exception as exc:
+            log.warning("disk pressure check failed: %s", exc)
         stop.wait(3600)
+
+
+def make_disk_monitor(rt):
+    """Monitor the volume that backs local media storage (None path = remote).
+
+    Object storage (S3) has no local volume to watch, so the monitor reports
+    "unknown" and stays silent rather than claiming a healthy disk it cannot
+    see. Thresholds come from settings so an operator can tune them per site.
+    """
+    from packages.observability.disk import DiskPressureMonitor
+
+    settings = rt.settings
+    path = getattr(rt.storage, "root", None) or None
+    if path is None:
+        log.info("disk pressure monitoring inactive: storage backend has no local volume")
+    return DiskPressureMonitor(
+        path,
+        warn=getattr(settings, "disk_warn_pct", 0.80),
+        critical=getattr(settings, "disk_critical_pct", 0.90),
+    )
+
+
+def _check_disk_pressure(rt, monitor, emit: Callable | None = None) -> Alert | None:
+    """Sample disk usage; enqueue ONE alert per level change. Returns it too.
+
+    `emit` is injectable so the behaviour (alert-once-per-crossing, severity
+    mapping, metric emission) is testable without a live alert sender.
+    """
+    level, ratio = monitor.poll()
+    if ratio is not None:
+        metrics.set("disk_used_ratio", ratio)
+    metrics.set("disk_pressure_level",
+                {disk.OK: 0.0, disk.WARNING: 1.0, disk.CRITICAL: 2.0}.get(level, 0.0))
+    changed = monitor.take_alert()
+    if changed is None or changed == disk.OK:
+        # Recovery is logged, not alerted: an operator told "critical" should
+        # hear that it cleared, but a green disk is not an incident.
+        if changed == disk.OK:
+            log.info("disk pressure cleared (usage %.1f%%)", (ratio or 0.0) * 100.0)
+        return None
+    pct = (ratio or monitor.last_ratio or 0.0) * 100.0
+    alert = Alert(
+        rule_id="system.disk",
+        rule_type="disk_pressure",
+        camera_id="",  # site-level, not camera-scoped
+        severity="critical" if changed == disk.CRITICAL else "warning",
+        title=f"storage {changed}",
+        message=(
+            f"media volume is {pct:.0f}% full — retention sweeps will start "
+            f"failing to reclaim space; free space or shorten retention"
+        ),
+        detail={"used_pct": round(pct, 1), "level": changed},
+    )
+    log.warning("disk pressure %s: %.0f%% full", changed, pct)
+    (emit or _alert_queue.put)(alert)
+    return alert
 
 
 def _sweep_retention(rt) -> None:
@@ -452,6 +518,7 @@ def run_camera(rt, camera: Camera, stop: threading.Event) -> None:
         attribute_interval_sec=settings.ai_attribute_interval_sec,
         privacy_masks=camera.privacy_masks,
         motion_gate_enabled=settings.ai_motion_gate_enabled,
+        motion_threshold=settings.ai_motion_threshold,
     )
 
     # Per-camera stop event: set when this camera is removed from the

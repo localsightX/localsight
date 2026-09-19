@@ -30,6 +30,10 @@ ui_audit/*
 # UI e2e throwaway artifacts (per-session server roots)
 ui_e2e_artifacts_*/
 ui_e2e_*.db
+# SQLite WAL sidecars (-wal/-shm) next to any ignored DB — WAL is on in dev
+# and in the UI e2e harness, so these appear beside every throwaway database.
+*.db-shm
+*.db-wal
 # UI maturity scan artifacts (regenerable via scripts/ui_maturity_scan.py)
 ui_maturity/
 .pw-browsers/

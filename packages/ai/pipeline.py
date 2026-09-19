@@ -77,6 +77,18 @@ _DETECTION_MAX_INTERVAL_SEC = 2.0
 # {x, y, w, h} rectangles.
 _MASK_MIN_OVERLAP = 0.5
 
+# Motion gate v2 (roadmap A5). The v1 gate compared a strided grid
+# byte-for-byte: ANY single-pixel change (sensor noise, auto-exposure
+# breathing, IR cut transitions) counted as motion, so on real cameras it
+# almost never skipped anything and paid the gate cost for nothing. v2 scores
+# the *mean absolute* frame-to-frame difference over a 64x64 grayscale grid
+# (0 = pixel-identical, 1 = black↔white) and skips the detector only when the
+# score is below a calibrated threshold. Threshold is per-camera overridable
+# (AI_MOTION_THRESHOLD) because a bright noisy outdoor scene and a dim indoor
+# corridor have very different noise floors.
+_MOTION_GRID = 64
+_MOTION_THRESHOLD_DEFAULT = 0.004  # ≈1 intensity level of mean delta (0-255)
+
 
 def _crop_vehicle(frame, bbox: tuple[float, float, float, float]):
     """Best-effort crop of a normalized bbox from a numpy frame; pass-through otherwise."""
@@ -171,6 +183,8 @@ class CameraPipeline:
         attribute_interval_sec: float = _ATTR_INTERVAL_SEC,
         privacy_masks: list[dict] | None = None,
         motion_gate_enabled: bool = False,
+        motion_threshold: float | None = None,
+        motion_grid: int = _MOTION_GRID,
     ) -> None:
         self.camera_id = camera_id
         self.detector = detector
@@ -190,11 +204,26 @@ class CameraPipeline:
         self.attributes = attributes
         self.attribute_interval = attribute_interval_sec
         self._masks = [m for m in (_parse_mask(x) for x in (privacy_masks or [])) if m]
-        # Motion gate (AI_MOTION_GATE_ENABLED): skip detection on frames with
-        # no pixel delta. Cheap frame-diff vs. running the full detector on a
-        # static scene; meaningful for real ONNX backends at higher fps.
+        # Motion gate (AI_MOTION_GATE_ENABLED): skip detection on frames whose
+        # mean absolute delta is below threshold. Cheap scalar scoring vs.
+        # running the full detector on a static scene; meaningful for real
+        # ONNX backends at higher fps. Threshold resolution order: explicit
+        # argument → AI_MOTION_THRESHOLD env → calibrated default.
         self.motion_gate_enabled = bool(motion_gate_enabled)
-        self._gate_prev: bytes | None = None
+        self.motion_grid = max(8, int(motion_grid))
+        if motion_threshold is None:
+            import os
+
+            motion_threshold = float(
+                os.environ.get("AI_MOTION_THRESHOLD", _MOTION_THRESHOLD_DEFAULT)
+            )
+        self.motion_threshold = float(motion_threshold)
+        self._gate_prev: object | None = None
+        # Observability for the camera-health surface: how much of the
+        # detector budget the gate is actually saving on this scene.
+        self.motion_frames = 0
+        self.motion_skips = 0
+        self.last_motion_score = 0.0
         self._anpr_last: dict[str, tuple[str | None, dt.datetime]] = {}
         self._attrs_last: dict[str, tuple[dt.datetime, dict]] = {}
         self._last_analytic: list[EventRow] = []  # point-in-time events (rules/anpr) for alerting
@@ -225,31 +254,62 @@ class CameraPipeline:
         return False
 
     # ── motion gate ──────────────────────────────────────────────────────────
-    def _frame_has_motion(self, frame) -> bool:
-        """Cheap delta check used to skip the detector on static scenes.
+    def motion_score(self, frame) -> float | None:
+        """Mean absolute frame-to-frame delta over a coarse grayscale grid.
 
-        A coarse downsample grid of the frame is compared byte-for-byte with
-        the previous frame's. Frames without decodeable pixels (None, synthetic
-        sources) always count as motion so the gate never stalls a pipeline.
+        Returns a score in [0, 1] (0 = pixel-identical, 1 = black↔white), or
+        None when pixels cannot be read (None / synthetic / undecodable
+        frames) — callers treat None as "always motion" so the gate can never
+        stall a pipeline. Pure numpy indexing: ~50 us on 640x360, i.e. orders
+        of magnitude cheaper than a single detector call — the whole point.
         """
         if frame is None:
-            return True
+            return None
         try:
             import numpy as np
 
             img = np.asarray(frame)
-            if img.size == 0:
-                return True
-            # Downsample to a coarse grid: robust to sensor noise, ~microseconds.
-            h = max(1, img.shape[0] // 32)
-            w = max(1, img.shape[1] // 32)
-            grid = np.ascontiguousarray(img[::h, ::w]).tobytes()
+            if img.size == 0 or img.ndim < 2:
+                return None
+            # Downsample on the NATIVE dtype first, then convert: strided
+            # slicing on uint8 is a free view, so we touch ~grid^2 pixels
+            # instead of the whole frame. Converting the full frame to float32
+            # first measured ~1.9 ms on 640x360 — as expensive as a small
+            # inference call, which defeats the purpose of the gate.
+            sh = max(1, img.shape[0] // self.motion_grid)
+            sw = max(1, img.shape[1] // self.motion_grid)
+            small_u8 = img[::sh, ::sw][: self.motion_grid, : self.motion_grid]
+            if small_u8.size == 0:
+                return None
+            g = small_u8.astype(np.float32)
+            if g.ndim == 3:
+                g = g[..., :3].mean(axis=2)  # luma is enough, 3x cheaper
+            if g.size and g.max() > 1.0:
+                g = g / 255.0
+            small = np.ascontiguousarray(g)
+            if small.size == 0:
+                return None
         except Exception:
+            return None
+        prev = self._gate_prev
+        self._gate_prev = small
+        if prev is None or getattr(prev, "shape", None) != small.shape:
+            return None  # first frame / geometry change: prime the baseline
+        return float(np.abs(small - prev).mean())
+
+    def _frame_has_motion(self, frame) -> bool:
+        """True when the frame should be handed to the detector.
+
+        Scored gate (v2): only a mean delta below `motion_threshold` skips
+        detection, so sensor noise / auto-exposure breathing no longer defeat
+        the gate. Frames without readable pixels always count as motion, so a
+        synthetic or byte-oriented source never starves the pipeline.
+        """
+        score = self.motion_score(frame)
+        if score is None:
             return True
-        if self._gate_prev is None or grid != self._gate_prev:
-            self._gate_prev = grid
-            return True
-        return False
+        self.last_motion_score = score
+        return score >= self.motion_threshold
 
     # ── enrolled embeddings (decrypted, cached) ─────────────────────────────
     def _refresh_enrolled(self, session) -> None:
@@ -283,6 +343,22 @@ class CameraPipeline:
         self._enrolled_watermark = latest
         self._enrolled_at = dt.datetime.now(dt.UTC).timestamp()
 
+    # ── detection stage (single choke point) ────────────────────────────────
+    def _detect_tracks(self, frame, ts) -> list:
+        """Run the detector and hand masked/low-confidence boxes to the tracker.
+
+        Extracted so the motion gate has exactly one place to bypass, and so
+        privacy masks are applied in exactly one place — BEFORE tracking
+        (architectural rule 6: masks suppress detections whose center falls
+        inside the mask or overlap it ≥50%).
+        """
+        raw = self.detector.detect(frame, ts)
+        detections = [
+            d for d in raw
+            if d.confidence >= self.confidence and not self._is_masked(d.bbox)
+        ]
+        return self.tracker.update(self.camera_id, detections, ts)
+
     # ── core frame processing (testable) ───────────────────────────────────
     def process_frame(self, session, frame, ts: dt.datetime) -> list[EventRow]:
         if dt.datetime.now(dt.UTC).timestamp() - self._enrolled_at > _ENROLLED_TTL:
@@ -291,17 +367,17 @@ class CameraPipeline:
         for st in self._active.values():
             st.seen_this_frame = False
 
-        if self.motion_gate_enabled and not self._frame_has_motion(frame):
-            # Static scene: still age out stale tracks so presence events close
-            # on schedule, but skip detection/tracking work entirely.
-            tracks = []
+        if self.motion_gate_enabled:
+            self.motion_frames += 1
+            if not self._frame_has_motion(frame):
+                # Static scene: still age out stale tracks so presence events
+                # close on schedule, but skip detection/tracking entirely.
+                self.motion_skips += 1
+                tracks = []
+            else:
+                tracks = self._detect_tracks(frame, ts)
         else:
-            raw = self.detector.detect(frame, ts)
-            detections = [
-                d for d in raw
-                if d.confidence >= self.confidence and not self._is_masked(d.bbox)
-            ]
-            tracks = self.tracker.update(self.camera_id, detections, ts)
+            tracks = self._detect_tracks(frame, ts)
         closed: list[EventRow] = []
 
         # ── behavior analytics + ANPR (point-in-time events) ───────────────

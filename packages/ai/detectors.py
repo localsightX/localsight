@@ -24,6 +24,14 @@ from typing import List, Optional
 from packages.ai.interfaces import Detection, Detector
 from packages.ai.registry import ModelRegistry
 
+# Upper bound on candidates handed to NMS per frame (same discipline as the
+# `max_det=300` mainstream exports apply in-model). Without it, a dense head
+# on a crowded scene makes NMS the dominant per-frame cost — measured at
+# ~800 ms/call with ~20k candidates above threshold in the pure-Python path.
+# The tracker cannot consume hundreds of objects from one camera anyway, so
+# keeping the top scorers changes nothing downstream and bounds the worst case.
+MAX_CANDIDATES = 300
+
 # Labels aligned with COCO/ONVIF so downstream behavior rules + event types map
 # cleanly across vendors.
 DEFAULT_LABELS = [
@@ -42,15 +50,115 @@ def iou(a, b) -> float:
     return inter / union if union > 0 else 0.0
 
 
+def postprocess_yolo_e2e(
+    raw,
+    labels: list[str],
+    conf_thr: float,
+    in_hw: tuple = (640, 640),
+    frame_hw: tuple = (360, 640),
+) -> list[Detection]:
+    """Decode an END-TO-END (NMS-free) YOLO export: (batch, max_det, 6).
+
+    Columns are x1,y1,x2,y2,conf,cls in model-input pixels (the `nms=False`
+    export path, e.g. YOLO26 end2end). Boxes are rescaled to normalized frame
+    space exactly like `postprocess_yolo` (stride padding is bottom/right
+    only, so the model saw the padded in_hw and we scale by frame/in).
+    Pure enough to unit-test with tiny synthetic tensors.
+    """
+    try:
+        import numpy as np
+    except Exception as exc:  # pragma: no cover - numpy is a runtime dep
+        raise RuntimeError("numpy is required for ONNX-style backends") from exc
+
+    arr = np.asarray(raw)
+    if arr.ndim != 3 or arr.shape[2] != 6:
+        return []
+    sx = frame_hw[1] / in_hw[1]
+    sy = frame_hw[0] / in_hw[0]
+    out: list[Detection] = []
+    for row in arr[0]:
+        conf = float(row[4])
+        if conf < conf_thr:
+            continue
+        x1, y1, x2, y2 = (float(v) for v in row[:4])
+        cls = int(row[5])
+        label = labels[cls] if 0 <= cls < len(labels) else "object"
+        out.append(Detection(
+            label=label,
+            confidence=conf,
+            bbox=(x1 * sx / frame_hw[1], y1 * sy / frame_hw[0],
+                  (x2 - x1) * sx / frame_hw[1], (y2 - y1) * sy / frame_hw[0]),
+        ))
+    return out
+
+
 def nms(boxes, scores, iou_thr: float = 0.45) -> List[int]:
-    """Pure-Python non-maximum suppression over normalized (x,y,w,h) boxes."""
-    order = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
-    keep: List[int] = []
-    while order:
-        i = order.pop(0)
-        keep.append(i)
-        order = [j for j in order if iou(boxes[i], boxes[j]) <= iou_thr]
-    return keep
+    """Non-maximum suppression over normalized (x,y,w,h) boxes.
+
+    Identical greedy semantics either way ("take the best box, drop everything
+    it overlaps") — the numpy path only changes *how many* candidates we can
+    afford. The pure-Python loop is O(n^2) with an interpreted `iou()` per
+    pair; measured at ~800 ms for a dense CPU head (~20k candidates above a
+    low confidence threshold). That is a whole frame budget burned on
+    de-duplication, so the vectorized implementation is the default whenever
+    numpy is importable, and the readable Python loop remains the fallback.
+    """
+    if not boxes:
+        return []
+    try:
+        import numpy as np
+    except Exception:
+        np = None  # numpy is optional for the reference paths
+    if np is None:
+        order = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
+        keep: List[int] = []
+        while order:
+            i = order.pop(0)
+            keep.append(i)
+            order = [j for j in order if iou(boxes[i], boxes[j]) <= iou_thr]
+        return keep
+
+    b = np.asarray(boxes, dtype=np.float32).reshape(-1, 4)
+    s = np.asarray(scores, dtype=np.float32).reshape(-1)
+    if b.shape[0] == 0:
+        return []
+    x1, y1 = b[:, 0], b[:, 1]
+    x2, y2 = b[:, 0] + b[:, 2], b[:, 1] + b[:, 3]
+    areas = np.clip(b[:, 2], 0, None) * np.clip(b[:, 3], 0, None)
+    # Ties keep original order (stable) exactly like the Python sort.
+    order = np.argsort(-s, kind="stable")
+    keep_np: list[int] = []
+    while order.size:
+        i = int(order[0])
+        keep_np.append(i)
+        if order.size == 1:
+            break
+        rest = order[1:]
+        ix = np.clip(np.minimum(x2[i], x2[rest]) - np.maximum(x1[i], x1[rest]), 0, None)
+        iy = np.clip(np.minimum(y2[i], y2[rest]) - np.maximum(y1[i], y1[rest]), 0, None)
+        inter = ix * iy
+        union = areas[i] + areas[rest] - inter
+        # union == 0 means two degenerate boxes: IoU is 0 (same as `iou()`).
+        overlap = np.where(union > 0, inter / np.where(union > 0, union, 1.0), 0.0)
+        order = rest[overlap <= iou_thr]
+    return keep_np
+
+
+def _cap_candidates(boxes: list, scores: list[float], idxs: list[int],
+                    max_candidates: int) -> tuple[list, list[float], list[int]]:
+    """Keep only the highest-scoring `max_candidates` boxes before NMS.
+
+    A detector head with thousands of low-confidence candidates (crowded
+    plaza, lowered confidence threshold) makes NMS the dominant per-frame cost
+    for no accuracy benefit — the tracker cannot consume hundreds of objects
+    from one camera anyway. Capping is what bounds the worst case, and it is
+    the same `max_det` discipline mainstream exports apply in-model.
+    """
+    if max_candidates <= 0 or len(scores) <= max_candidates:
+        return boxes, scores, idxs
+    top = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:max_candidates]
+    top.sort()  # preserve original order; NMS re-sorts by score internally
+    return ([boxes[i] for i in top], [scores[i] for i in top], [idxs[i] for i in top])
 
 
 def postprocess_yolo(
@@ -60,6 +168,7 @@ def postprocess_yolo(
     iou_thr: float = 0.45,
     in_hw: tuple = (640, 640),
     frame_hw: tuple = (360, 640),
+    max_candidates: int = MAX_CANDIDATES,
 ) -> List[Detection]:
     """Convert a YOLO-style ONNX output to Detections.
 
@@ -134,6 +243,7 @@ def postprocess_yolo(
             idxs.append(label_idx)
 
     detections: List[Detection] = []
+    boxes_n, scores_n, idxs = _cap_candidates(boxes_n, scores_n, idxs, max_candidates)
     for i in nms(boxes_n, scores_n, iou_thr):
         label = labels[idxs[i]] if idxs[i] < len(labels) else f"class_{idxs[i]}"
         detections.append(Detection(label=label, confidence=float(scores_n[i]), bbox=tuple(boxes_n[i])))  # type: ignore[arg-type]
@@ -166,16 +276,130 @@ class _RuntimeDetector(Detector):
         self.in_hw = in_hw
         self.frame_hw = frame_hw
         self._session = None
+        # Inference watchdog (reliability plan F6): a wedged accelerator shows
+        # up as runaway single-call latency. Overridable for slow hosts.
+        import os
+
+        self.watchdog_sec = float(os.environ.get("AI_INFERENCE_WATCHDOG_SEC", "15"))
+        self._slow_streak = 0
+        # Circuit breaker (reliability plan F1): a detector whose session is
+        # permanently broken (corrupt CUDA context, unloaded plugin) would
+        # otherwise burn a full inference attempt — and an exception log line —
+        # on every sampled frame for the lifetime of the worker, starving the
+        # other cameras on the box. After this many consecutive failures the
+        # breaker opens for a cooldown window and the detector fails *open*
+        # (returns no detections) instead of thrashing.
+        self.circuit_threshold = int(os.environ.get("AI_DETECTOR_CIRCUIT_FAILURES", "5"))
+        self.circuit_cooldown_sec = float(os.environ.get("AI_DETECTOR_CIRCUIT_COOLDOWN_SEC", "30"))
+        self._error_streak = 0
+        self._open_until = 0.0
+        # Last single-call latency (ms) — read by the bench harness and the
+        # camera-health surface; cheap, no histogram machinery. Written via
+        # the _latency_ms property so __new__-built instances (tests construct
+        # detectors without __init__) read 0.0 instead of raising.
+        self._latency_ms = 0.0
+
+    @property
+    def last_inference_ms(self) -> float:
+        return float(getattr(self, "_latency_ms", 0.0))
+
+    @last_inference_ms.setter
+    def last_inference_ms(self, value: float) -> None:
+        self._latency_ms = float(value)
 
     def _ensure_session(self):
         raise NotImplementedError
 
+    # ── circuit breaker state (defensive: __new__-built instances in tests) ──
+    @property
+    def breaker_open(self) -> bool:
+        """True while inference is short-circuited after repeated failures."""
+        import time as _time
+
+        return float(getattr(self, "_open_until", 0.0)) > _time.monotonic()
+
+    def _watched_infer(self, img):
+        """Time one session.run; two consecutive over-watchdog calls rebuild
+        the session so the next frame gets a fresh runtime instead of
+        retrying into a wedged one. Detection-only: TensorRT/OpenVINO/TFLite
+        subclasses inherit this through detect()."""
+        import logging
+        import time as _time
+
+        t0 = _time.monotonic()
+        out = self._infer(img)
+        took = _time.monotonic() - t0
+        self.last_inference_ms = took * 1000.0
+        if took > self.watchdog_sec:
+            self._slow_streak += 1
+            if self._slow_streak >= 2:
+                self._slow_streak = 0
+                self._session = None  # rebuilt lazily by _ensure_session()
+                logging.getLogger("localsight.detector").warning(
+                    "inference watchdog: %s call took %.1fs (>%.0fs x2) — "
+                    "session will be rebuilt", type(self).__name__, took,
+                    self.watchdog_sec,
+                )
+        else:
+            self._slow_streak = 0
+        return out
+
+    def _on_inference_error(self, exc: Exception) -> bool:
+        """Record a failed inference; True once the breaker has just opened.
+
+        Returns True only on the transition, so the caller can fail open
+        without error-logging every subsequent frame during the cooldown.
+        """
+        import logging
+
+        self._error_streak = int(getattr(self, "_error_streak", 0)) + 1
+        if self._error_streak < int(getattr(self, "circuit_threshold", 5)):
+            return False
+        import time as _time
+
+        self._error_streak = 0
+        self._open_until = _time.monotonic() + float(
+            getattr(self, "circuit_cooldown_sec", 30.0)
+        )
+        self._session = None  # a rebuilt session is the recovery path
+        logging.getLogger("localsight.detector").error(
+            "detector circuit breaker OPEN for %.0fs after %d consecutive "
+            "%s failures (last: %s) — returning empty detections until the "
+            "cooldown expires",
+            getattr(self, "circuit_cooldown_sec", 30.0),
+            int(getattr(self, "circuit_threshold", 5)),
+            type(self).__name__, exc,
+        )
+        return True
+
     def detect(self, frame: object, ts) -> List[Detection]:
+        if self.breaker_open:
+            # Fail open: the pipeline keeps ticking (tracks age out, presence
+            # events still close) while a broken runtime recovers. Half-open on
+            # expiry — the next call gets one attempt with a fresh session.
+            return []
+        self._open_until = 0.0
         self._ensure_session()
         import numpy as np
 
         img = self._preprocess(np.asarray(frame) if not isinstance(frame, bytes) else self._decode(frame))
-        out = self._infer(img)
+        try:
+            out = self._watched_infer(img)
+        except Exception as exc:  # breaker decision, re-raised below
+            if self._on_inference_error(exc):
+                return []  # breaker just opened: this frame yields no detections
+            raise
+        self._error_streak = 0
+        arr = np.asarray(out)
+        # END-TO-END (NMS-free) export: (batch, max_det, 6) — decode directly;
+        # the classic transposed/row-major layouts fall through to the shared
+        # postprocess_yolo decoder.
+        if arr.ndim == 3 and arr.shape[2] == 6 and 0 < arr.shape[1] <= 1000:
+            _, _, model_h, model_w = img.shape
+            return postprocess_yolo_e2e(
+                arr, self.labels, self.conf_thr,
+                in_hw=(model_h, model_w), frame_hw=self.frame_hw,
+            )
         # The padded input dims drive box scaling: _preprocess pads to a
         # stride multiple, so the model saw (padded_w, padded_h), and boxes
         # must map back through that geometry — not the nominal in_hw.
@@ -220,6 +444,22 @@ class _RuntimeDetector(Detector):
 
 
 class ONNXDetector(_RuntimeDetector):
+    """ONNX Runtime detector with an env-tunable execution plan (roadmap A1).
+
+    Three knobs decide whether an INT8/edge deployment actually hits its
+    latency budget, and all three are deployment-specific — so they are env
+    overrides rather than hard-coded choices:
+
+      AI_DETECTOR_PROVIDER   explicit EP preference list, comma-separated
+                             (e.g. "TensorrtExecutionProvider,CUDAExecutionProvider").
+                             Unset = auto: CUDA → CoreML → CPU.
+      AI_ORT_INTRA_THREADS   intra-op thread pool size. Default 0 = ORT's own
+                             heuristic, which over-subscribes on a box running
+                             one worker thread per camera — pinning this is the
+                             single biggest win for 6+ camera CPU deployments.
+      AI_ORT_GRAPH_OPT       disable | basic | extended | all (default all).
+    """
+
     def _ensure_session(self):
         if self._session is not None:
             return
@@ -227,13 +467,42 @@ class ONNXDetector(_RuntimeDetector):
             import onnxruntime as ort
         except Exception as exc:
             raise RuntimeError("onnxruntime is not installed (pip install onnxruntime)") from exc
-        # Prefer GPU when available, fall back to CPU. Providers not installed
-        # on this host are dropped (CoreML on macOS, CUDA on non-NVIDIA) so
-        # onnxruntime doesn't warn on every session build.
+        import os
+
+        # Providers not installed on this host are dropped (CoreML on macOS,
+        # CUDA on non-NVIDIA) so onnxruntime doesn't warn on every session build.
         available = set(ort.get_available_providers())
-        preferred = [p for p in ("CUDAExecutionProvider", "CoreMLExecutionProvider",
-                                 "CPUExecutionProvider") if p in available]
-        self._session = ort.InferenceSession(self.model_path, providers=preferred)
+        override = os.environ.get("AI_DETECTOR_PROVIDER", "").strip()
+        if override:
+            wanted = [p.strip() for p in override.split(",") if p.strip()]
+            missing = [p for p in wanted if p not in available]
+            if missing:
+                raise RuntimeError(
+                    f"AI_DETECTOR_PROVIDER names unavailable provider(s) {missing} "
+                    f"(available: {sorted(available)})"
+                )
+            preferred = wanted
+        else:
+            preferred = [p for p in ("CUDAExecutionProvider", "CoreMLExecutionProvider",
+                                     "CPUExecutionProvider") if p in available]
+
+        opts = ort.SessionOptions()
+        opts.graph_optimization_level = {
+            "disable": ort.GraphOptimizationLevel.ORT_DISABLE_ALL,
+            "basic": ort.GraphOptimizationLevel.ORT_ENABLE_BASIC,
+            "extended": ort.GraphOptimizationLevel.ORT_ENABLE_EXTENDED,
+            "all": ort.GraphOptimizationLevel.ORT_ENABLE_ALL,
+        }.get(
+            os.environ.get("AI_ORT_GRAPH_OPT", "all").strip().lower(),
+            ort.GraphOptimizationLevel.ORT_ENABLE_ALL,
+        )
+        threads = int(os.environ.get("AI_ORT_INTRA_THREADS", "0") or 0)
+        if threads > 0:
+            opts.intra_op_num_threads = threads
+            opts.inter_op_num_threads = 1
+        opts.enable_mem_pattern = True  # stable shapes (letterboxed input)
+        self._session = ort.InferenceSession(self.model_path, sess_options=opts,
+                                             providers=preferred)
         self._input_name = self._session.get_inputs()[0].name
 
     def _infer(self, img):

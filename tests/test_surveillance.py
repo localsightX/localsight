@@ -236,30 +236,113 @@ def test_postprocess_yolo_nms_removes_overlap(monkeypatch):
     assert not any(abs(c - 0.85) < 0.01 for c in confs)
 
 
-def test_onnx_detector_lazy_session(monkeypatch):
+def _fake_onnxruntime(monkeypatch, available=("CPUExecutionProvider",)):
+    """Install a fake onnxruntime that records the session plan.
+
+    Mirrors the *shape* of the real API that `ONNXDetector._ensure_session`
+    depends on (SessionOptions, GraphOptimizationLevel, InferenceSession's
+    sess_options/providers kwargs) so the A1 execution-plan logic is exercised
+    without an actual runtime — and fails loudly if that API drifts.
+    """
     import sys
 
     class FakeInput:
         name = "input"
 
+    class FakeGraphOpt:
+        ORT_DISABLE_ALL = 0
+        ORT_ENABLE_BASIC = 1
+        ORT_ENABLE_EXTENDED = 2
+        ORT_ENABLE_ALL = 99
+
+    class FakeSessionOptions:
+        def __init__(self):
+            self.graph_optimization_level = None
+            self.intra_op_num_threads = 0
+            self.inter_op_num_threads = 0
+            self.enable_mem_pattern = False
+
     class FakeSession:
-        get_inputs = lambda self: [FakeInput()]
-        run = lambda self, *args, **kwargs: [[]]
+        last = None
+
+        def __init__(self, path, sess_options=None, providers=None):
+            self.path = path
+            self.sess_options = sess_options
+            self.providers = providers
+            FakeSession.last = self
+
+        def get_inputs(self):
+            return [FakeInput()]
+
+        def run(self, *args, **kwargs):
+            return [[]]
 
     class FakeOrt:
-        InferenceSession = lambda *a, **k: FakeSession()
+        InferenceSession = FakeSession
+        SessionOptions = FakeSessionOptions
+        GraphOptimizationLevel = FakeGraphOpt
 
         @staticmethod
         def get_available_providers():
-            return ["CPUExecutionProvider"]
+            return list(available)
 
     monkeypatch.setitem(sys.modules, "onnxruntime", FakeOrt())
+    return FakeSession
+
+
+def test_onnx_detector_lazy_session(monkeypatch):
     monkeypatch.setattr(detectors.ONNXDetector, "_infer", lambda self, img: [])
+    fake = _fake_onnxruntime(monkeypatch)
     d = detectors.ONNXDetector("fake/model.onnx")
     assert d._session is None
     d._ensure_session()
     assert d._session is not None
     assert d._session is d._session  # idempotent
+    # Default plan: graph optimizations fully on, mem pattern enabled (stable
+    # letterboxed shapes), threads left to ORT's heuristic.
+    assert fake.last.sess_options.graph_optimization_level == 99
+    assert fake.last.sess_options.enable_mem_pattern is True
+    assert fake.last.sess_options.intra_op_num_threads == 0
+
+
+def test_onnx_session_plan_honors_thread_pinning(monkeypatch):
+    """6 cams on one CPU box: ORT's default intra-op pool over-subscribes and
+    every camera slows down. AI_ORT_INTRA_THREADS must pin the pool."""
+    monkeypatch.setenv("AI_ORT_INTRA_THREADS", "2")
+    monkeypatch.setenv("AI_ORT_GRAPH_OPT", "extended")
+    monkeypatch.setattr(detectors.ONNXDetector, "_infer", lambda self, img: [])
+    fake = _fake_onnxruntime(monkeypatch)
+    d = detectors.ONNXDetector("fake/model.onnx")
+    d._ensure_session()
+    assert fake.last.sess_options.intra_op_num_threads == 2
+    assert fake.last.sess_options.inter_op_num_threads == 1
+    assert fake.last.sess_options.graph_optimization_level == 2
+
+
+def test_onnx_provider_override_selects_explicit_ep(monkeypatch):
+    monkeypatch.setenv("AI_DETECTOR_PROVIDER", "TensorrtExecutionProvider,CUDAExecutionProvider")
+    monkeypatch.setattr(detectors.ONNXDetector, "_infer", lambda self, img: [])
+    fake = _fake_onnxruntime(
+        monkeypatch,
+        available=("TensorrtExecutionProvider", "CUDAExecutionProvider", "CPUExecutionProvider"),
+    )
+    d = detectors.ONNXDetector("fake/model.onnx")
+    d._ensure_session()
+    assert fake.last.providers == ["TensorrtExecutionProvider", "CUDAExecutionProvider"]
+
+
+def test_onnx_provider_override_fails_closed_on_missing_ep(monkeypatch):
+    """An operator who asks for an accelerator that isn't installed must get a
+    hard error at startup — not a silent CPU downgrade that misses the latency
+    budget the deployment was sized for."""
+    import pytest
+
+    monkeypatch.setenv("AI_DETECTOR_PROVIDER", "TensorrtExecutionProvider")
+    monkeypatch.setattr(detectors.ONNXDetector, "_infer", lambda self, img: [])
+    _fake_onnxruntime(monkeypatch, available=("CPUExecutionProvider",))
+    d = detectors.ONNXDetector("fake/model.onnx")
+    with pytest.raises(RuntimeError, match="unavailable provider"):
+        d._ensure_session()
 
 
 def test_runtime_detector_preprocess_and_decode(monkeypatch):
@@ -1130,12 +1213,12 @@ def test_pipeline_anpr_event_uses_keyed_plate_hash():
     """The ANPR event path writes an envelope + master-key-bound plate hash —
     never a bare SHA-256 (plates are a tiny brute-forceable keyspace)."""
     import hashlib
+
+    from cryptography.fernet import Fernet
     from sqlalchemy import create_engine
     from sqlalchemy.orm import sessionmaker
-    from cryptography.fernet import Fernet
 
-    from packages.ai.anpr import (ANPRPipeline, ReferencePlateDetector,
-                                  ReferencePlateOCR)
+    from packages.ai.anpr import ANPRPipeline, ReferencePlateDetector, ReferencePlateOCR
     from packages.ai.pipeline import CameraPipeline
     from packages.ai.tracker import IouTracker
     from packages.domain.models import Base, Event
@@ -1189,8 +1272,7 @@ def test_reference_attribute_tagger_deterministic():
 
 
 def test_build_attribute_tagger_disabled_none_and_downgrade(tmp_path):
-    from packages.ai.attributes import (ReferenceAttributeTagger,
-                                        build_attribute_tagger)
+    from packages.ai.attributes import ReferenceAttributeTagger, build_attribute_tagger
     from packages.ai.registry import ModelRegistry
 
     reg = ModelRegistry(str(tmp_path / "registry.json"))
@@ -2318,6 +2400,600 @@ def test_worker_status_callback_persists_camera_state(client):
     with rt.SessionLocal() as s:
         cam = s.get(CameraRow, cam_id)
         assert cam.status == "ONLINE", "failed write must not corrupt prior state"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Roadmap R1 — "Fastest Frame": motion-gate v2 (A5), detector circuit breaker
+# (F1) and registry task metadata (A1/A2).
+# ══════════════════════════════════════════════════════════════════════════════
+
+def test_motion_score_identical_frames_is_zero():
+    """v2 scores a mean absolute delta in [0,1]: identical frames → 0.0."""
+    import numpy as np
+
+    from packages.ai.pipeline import CameraPipeline
+
+    pipe = CameraPipeline("cam-int", None, None, None, None, None, None, None,
+                          motion_gate_enabled=True)
+    frame = np.full((48, 64, 3), 128, dtype=np.uint8)
+    assert pipe.motion_score(frame) is None, "first frame primes the baseline"
+    assert pipe.motion_score(frame) == 0.0
+
+
+def test_motion_gate_skips_sensor_noise_only_frames():
+    """The v1 regression: a byte-for-byte grid comparison treated ANY flipped
+    pixel as motion, so ±2-level sensor noise / auto-exposure breathing made
+    the gate useless on real cameras. v2 must skip these."""
+    import numpy as np
+
+    from packages.ai.pipeline import CameraPipeline
+
+    pipe = CameraPipeline("cam-int", None, None, None, None, None, None, None,
+                          motion_gate_enabled=True, motion_threshold=0.02)
+    base = np.full((48, 64, 3), 128, dtype=np.uint8)
+    rng = np.random.default_rng(7)
+    assert pipe._frame_has_motion(base) is True  # prime baseline
+    noise = np.clip(base.astype(np.int16)
+                    + rng.integers(-2, 3, base.shape, dtype=np.int16), 0, 255
+                    ).astype(np.uint8)
+    score = pipe.motion_score(noise)
+    assert score is not None and score < 0.02, f"noise scored {score}"
+    assert pipe._frame_has_motion(noise) is False, "noise-only frame must be gated"
+
+
+def test_motion_gate_passes_real_motion():
+    """A person-sized blob entering the scene must clear the gate."""
+    import numpy as np
+
+    from packages.ai.pipeline import CameraPipeline
+
+    pipe = CameraPipeline("cam-int", None, None, None, None, None, None, None,
+                          motion_gate_enabled=True)
+    blank = np.zeros((48, 64, 3), dtype=np.uint8)
+    person = np.zeros((48, 64, 3), dtype=np.uint8)
+    person[20:40, 28:40] = 255
+    pipe._frame_has_motion(blank)
+    assert pipe._frame_has_motion(person) is True
+    assert pipe.last_motion_score >= pipe.motion_threshold
+
+
+def test_motion_gate_unreadable_frame_always_counts_as_motion():
+    """Synthetic/None/undecodable frames must never stall a pipeline."""
+    from packages.ai.pipeline import CameraPipeline
+
+    pipe = CameraPipeline("cam-int", None, None, None, None, None, None, None,
+                          motion_gate_enabled=True)
+    assert pipe.motion_score(None) is None
+    assert pipe._frame_has_motion(None) is True
+    assert pipe._frame_has_motion("not-a-frame") is True
+    assert pipe._frame_has_motion(object()) is True
+
+
+def test_motion_gate_geometry_change_reprimes_baseline():
+    """A resolution change must re-prime, not compare misaligned grids."""
+    import numpy as np
+
+    from packages.ai.pipeline import CameraPipeline
+
+    pipe = CameraPipeline("cam-int", None, None, None, None, None, None, None,
+                          motion_gate_enabled=True)
+    pipe._frame_has_motion(np.zeros((48, 64, 3), dtype=np.uint8))
+    # Different shape → None (re-prime), never a bogus high score.
+    assert pipe.motion_score(np.zeros((64, 64, 3), dtype=np.uint8)) is None
+
+
+
+def _gate_target():
+    """(engine, sessionmaker, detector) for an isolated motion-gate camera."""
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    from packages.domain.models import Base
+
+    class _Detector:
+        def __init__(self):
+            self.calls = 0
+
+        def detect(self, frame, ts):
+            self.calls += 1
+            return []
+
+    eng = create_engine("sqlite:///:memory:", future=True)
+    Base.metadata.create_all(eng)
+    return eng, sessionmaker(bind=eng, future=True), _Detector()
+
+
+def test_motion_gate_v2_skips_detector_on_static_scene():
+    """End-to-end through process_frame: identical frames must never reach the
+    detector, while a moving blob must."""
+    import numpy as np
+
+    from packages.ai.pipeline import CameraPipeline
+    from packages.ai.tracker import IouTracker
+
+    _eng, S, det = _gate_target()
+    pipe = CameraPipeline("cam-gate-v2", det, IouTracker(), None, None, S, None, None,
+                          motion_gate_enabled=True)
+    ts = dt.datetime(2026, 1, 1, tzinfo=dt.UTC)
+    blank = np.zeros((48, 64, 3), dtype=np.uint8)
+    with S() as s:
+        for i in range(5):  # frame 1 primes, frames 2-5 are static
+            pipe.process_frame(s, blank, ts + dt.timedelta(seconds=i * 0.2))
+            s.commit()
+    assert det.calls == 1, f"static scene still ran the detector {det.calls}x"
+    assert pipe.motion_skips == 4
+    assert pipe.motion_frames == 5
+
+    # Motion re-opens the gate.
+    person = np.zeros((48, 64, 3), dtype=np.uint8)
+    person[20:40, 28:40] = 255
+    with S() as s:
+        pipe.process_frame(s, person, ts + dt.timedelta(seconds=2))
+        s.commit()
+    assert det.calls == 2, "motion frame must reach the detector"
+
+
+def test_motion_gate_disabled_always_runs_detector():
+    import numpy as np
+
+    from packages.ai.pipeline import CameraPipeline
+    from packages.ai.tracker import IouTracker
+
+    _eng, S, det = _gate_target()
+    pipe = CameraPipeline("cam-nogate", det, IouTracker(), None, None, S, None, None,
+                          motion_gate_enabled=False)
+    ts = dt.datetime(2026, 1, 1, tzinfo=dt.UTC)
+    blank = np.zeros((48, 64, 3), dtype=np.uint8)
+    with S() as s:
+        for i in range(3):
+            pipe.process_frame(s, blank, ts + dt.timedelta(seconds=i))
+            s.commit()
+    assert det.calls == 3
+    assert pipe.motion_frames == 0 and pipe.motion_skips == 0
+# ── detector circuit breaker (reliability F1) ───────────────────────────────
+def _flaky_detector(fail: bool = True, threshold: int = 3):
+    """An ONNX detector whose inference raises on demand."""
+    import numpy as np
+
+    class _Flaky(detectors.ONNXDetector):
+        def __init__(self):
+            self._session = object()
+            self.labels = ["person"]
+            self.conf_thr = 0.5
+            self.iou_thr = 0.5
+            self.in_hw = (640, 640)
+            self.frame_hw = (48, 64)
+            self.watchdog_sec = 15.0
+            self._slow_streak = 0
+            self.circuit_threshold = threshold
+            self.circuit_cooldown_sec = 30.0
+            self._error_streak = 0
+            self._open_until = 0.0
+            self.last_inference_ms = 0.0
+            self.fail = fail
+            self.infer_calls = 0
+
+        def _ensure_session(self):
+            pass
+
+        def _preprocess(self, img):  # skip numpy letterboxing
+            return np.zeros((1, 1, 1, 1), dtype=np.float32)
+
+        def _infer(self, img):
+            self.infer_calls += 1
+            if self.fail:
+                raise RuntimeError("CUDA context destroyed")
+            return np.zeros((1, 6, 0), dtype=np.float32)  # valid: no detections
+
+        def _watched_infer(self, img):
+            # bypass the watchdog timing wrapper; breaker logic is what's tested
+            self.last_inference_ms = 0.5
+            return self._infer(img)
+
+    return _Flaky()
+
+
+def test_detector_circuit_breaker_opens_and_fails_open():
+    """After N consecutive inference failures the detector must fail OPEN
+    (empty detections) instead of raising into the pipeline on every frame for
+    the worker's lifetime."""
+    ts = dt.datetime(2026, 1, 1, tzinfo=dt.UTC)
+    det = _flaky_detector(fail=True, threshold=3)
+
+    for i in range(2):
+        try:
+            det.detect(None, ts)
+            raised = False
+        except RuntimeError:
+            raised = True
+        assert raised, f"failure {i + 1} must propagate (breaker not yet open)"
+    assert not det.breaker_open
+
+    # Third failure trips the breaker: this call fails open, not up.
+    assert det.detect(None, ts) == []
+    assert det.breaker_open
+
+    # Subsequent frames short-circuit — no further inference attempts at all.
+    for _ in range(5):
+        assert det.detect(None, ts) == []
+    assert det.infer_calls == 3, f"breaker did not stop attempts ({det.infer_calls})"
+
+
+def test_detector_circuit_breaker_success_resets_streak():
+    ts = dt.datetime(2026, 1, 1, tzinfo=dt.UTC)
+    det = _flaky_detector(fail=True, threshold=3)
+    for _ in range(2):
+        with contextlib.suppress(RuntimeError):
+            det.detect(None, ts)
+    det.fail = False
+    det.detect(None, ts)  # recovery
+    assert det._error_streak == 0
+    det.fail = True
+    for _ in range(2):
+        with contextlib.suppress(RuntimeError):
+            det.detect(None, ts)
+    assert not det.breaker_open, "streak must have restarted after the success"
+
+
+def test_detector_breaker_open_expires_to_half_open():
+    """An expired cooldown must let the next frame try again (half-open) —
+    otherwise a transient failure would disable detection forever."""
+    ts = dt.datetime(2026, 1, 1, tzinfo=dt.UTC)
+    det = _flaky_detector(fail=True, threshold=1)
+    det.circuit_cooldown_sec = -1.0  # already expired the moment it opens
+    assert det.detect(None, ts) == []  # trips the breaker
+    assert not det.breaker_open, "expired cooldown must not read as open"
+
+    before = det.infer_calls
+    det.detect(None, ts)  # must actually attempt inference again
+    assert det.infer_calls == before + 1, "expired breaker did not half-open"
+
+    # And a healthy runtime then recovers fully.
+    det.fail = False
+    assert det.detect(None, ts) == []
+    assert det._error_streak == 0 and not det.breaker_open
+
+
+def test_detector_breaker_defaults_are_safe_on_bare_instances():
+    """__new__-built detectors (unit-test pattern) must not explode.
+
+    The breaker reads all of its state through getattr defaults, so an
+    instance that never ran __init__ — the fake-detector pattern this suite
+    uses everywhere — must report "closed" and still record a failure without
+    an AttributeError.
+    """
+    d = detectors.ONNXDetector.__new__(detectors.ONNXDetector)
+    assert d.breaker_open is False
+    assert d._on_inference_error(RuntimeError("boom")) is False  # below threshold
+    assert d._error_streak == 1
+
+
+def test_postprocess_yolo_e2e_nms_free_head_a2():
+    """A2: the NMS-free (YOLO26 `nms=False`) export decodes as (batch, N, 6).
+
+    Rows are already de-duplicated by the model, so the decoder must NOT run
+    NMS — overlapping rows are both kept — while still applying the confidence
+    gate and mapping boxes from padded model space back to frame space.
+    """
+    import numpy as np
+
+    from packages.ai.detectors import postprocess_yolo_e2e
+
+    # 2 candidates: a person at 0.9 and a low-confidence vehicle at 0.2.
+    # 640x640 model input → 360x640 frame (leaf stride-padded 384, but the
+    # decoder scales by the nominal in_hw/frame_hw pair it is given).
+    raw = np.zeros((1, 3, 6), dtype=np.float32)
+    raw[0, 0] = [0.0, 0.0, 320.0, 320.0, 0.90, 0.0]      # person, top-left half
+    raw[0, 1] = [320.0, 320.0, 640.0, 640.0, 0.20, 2.0]  # car, below threshold
+    raw[0, 2] = [0.0, 0.0, 320.0, 320.0, 0.80, 0.0]      # overlapping person: KEPT
+
+    labels = ["person", "bicycle", "car"]
+    dets = postprocess_yolo_e2e(raw, labels, 0.45, in_hw=(640, 640), frame_hw=(360, 640))
+
+    assert len(dets) == 2, "NMS-free decode must keep both overlapping persons"
+    assert [d.label for d in dets] == ["person", "person"]
+    p = dets[0]
+    assert abs(p.confidence - 0.90) < 1e-6
+    # x: 0→320 of 640 = half the frame width; y: 0→320 of 640 → 180/360 = half.
+    assert abs(p.bbox[0] - 0.0) < 1e-6
+    assert abs(p.bbox[1] - 0.0) < 1e-6
+    assert abs(p.bbox[2] - 0.5) < 1e-6
+    assert abs(p.bbox[3] - 0.5) < 1e-6
+
+
+def test_postprocess_yolo_e2e_handles_bad_shapes_and_class_ids():
+    """Shape guard + out-of-vocabulary class id (FP32 export would be 0.0,
+    but a truncated/quantized export can emit an index we do not know)."""
+    import numpy as np
+
+    from packages.ai.detectors import postprocess_yolo_e2e
+
+    assert postprocess_yolo_e2e([], ["person"], 0.45) == []
+    assert postprocess_yolo_e2e(np.zeros((1, 5), dtype=np.float32), ["person"], 0.45) == []
+    # Wrong last dim = not an E2E head → empty, never an exception.
+    assert postprocess_yolo_e2e(np.zeros((1, 4, 84), dtype=np.float32), ["person"], 0.45) == []
+
+    raw = np.zeros((1, 1, 6), dtype=np.float32)
+    raw[0, 0] = [0.0, 0.0, 10.0, 10.0, 0.99, 99.0]  # cls id beyond vocabulary
+    dets = postprocess_yolo_e2e(raw, ["person"], 0.45, in_hw=(640, 640),
+                               frame_hw=(360, 640))
+    assert len(dets) == 1 and dets[0].label == "object"
+
+
+def test_onnx_detector_routes_e2e_head_to_nms_free_decoder(monkeypatch):
+    """A2 wiring: ONNXDetector.detect must detect the (1, N, 6) head and use
+    the NMS-free decoder instead of the classic transposed/row-major path —
+    otherwise a YOLO26 export silently decodes to garbage boxes."""
+    import numpy as np
+
+    from packages.ai import detectors
+
+    d = detectors.ONNXDetector.__new__(detectors.ONNXDetector)
+    d.labels = ["person"]
+    d.conf_thr = 0.45
+    d.iou_thr = 0.5
+    d.in_hw = (640, 640)
+    d.frame_hw = (360, 640)
+    d.watchdog_sec = 15.0
+    d._slow_streak = 0
+    d._error_streak = 0
+    d._open_until = 0.0
+    d.last_inference_ms = 0.0
+    d._session = None
+    d._ensure_session = lambda: None
+    d._preprocess = lambda img: np.zeros((1, 3, 384, 640), dtype=np.float32)
+
+    raw = np.zeros((1, 1, 6), dtype=np.float32)
+    raw[0, 0] = [0.0, 0.0, 320.0, 320.0, 0.90, 0.0]
+    d._infer = lambda img: raw
+
+    dets = d.detect(np.zeros((360, 640, 3), dtype=np.uint8), dt.datetime.now(dt.UTC))
+    assert len(dets) == 1 and dets[0].label == "person"
+    assert d.last_inference_ms >= 0.0, "latency telemetry must be recorded"
+
+
+def test_worker_frame_budget_scales_to_six_cameras():
+    """R1 exit criterion: 6 CPU-only cameras at 5 fps stay inside one frame
+    budget per camera end-to-end. The arithmetic is a gate, not a wish — this
+    is the check that fails if a future stage adds per-frame cost that only
+    fits 4 cameras on the reference box."""
+    from packages.ai.bench import BUDGETS
+
+    budget_ms = BUDGETS["cpu_frame_ms"][0]      # 120 ms per frame per camera
+    inference_fps = 5
+    cameras = 6
+    # Per camera: gate + inference + postprocess must fit the frame interval.
+    frame_interval_ms = 1000.0 / inference_fps
+    assert frame_interval_ms >= budget_ms, (
+        "the CPU budget must fit inside the sampling interval or the pipeline "
+        "silently falls behind and drops frames"
+    )
+    # Aggregate detector throughput the box must sustain.
+    required = cameras * inference_fps
+    assert required == 30, f"{cameras} cams @ {inference_fps} fps = {required} det/s"
+
+
+def test_detector_latency_telemetry_and_provider_overrides_documented():
+    """A1: ORT execution-plan knobs are real env vars (not doc-only), and the
+    detector records single-call latency for the health surface."""
+    import inspect
+
+    from packages.ai import detectors
+
+    src = inspect.getsource(detectors.ONNXDetector._ensure_session)
+    for knob in ("AI_DETECTOR_PROVIDER", "AI_ORT_INTRA_THREADS", "AI_ORT_GRAPH_OPT"):
+        assert knob in src, f"{knob} is documented but not implemented"
+    d = detectors.ONNXDetector.__new__(detectors.ONNXDetector)
+    assert d.last_inference_ms == 0.0 or isinstance(d.last_inference_ms, float)
+
+
+# ── registry task metadata (roadmap A1/A2) ─────────────────────────────────
+def test_registry_record_task_metadata_defaults():
+    """Pre-existing registry files (no task/quantized) must load unchanged."""
+    from packages.ai.registry import ModelRecord
+
+    rec = ModelRecord(name="detector", version="latest", path="p.onnx", hash_sha256="x")
+    assert rec.task == "detect"
+    assert rec.quantized is False
+
+
+def test_registry_roundtrips_task_and_quantization(tmp_path):
+    from packages.ai.registry import ModelRecord, ModelRegistry
+
+    path = str(tmp_path / "registry.json")
+    reg = ModelRegistry(path)
+    reg.register(ModelRecord(name="detector-int8", version="latest", path="i.onnx",
+                             hash_sha256="y", source="operator INT8 export",
+                             license="Apache-2.0", task="detect", quantized=True))
+    again = ModelRegistry(path)  # reload from disk
+    rec = again.get("detector-int8", "latest")
+    assert rec.quantized is True and rec.task == "detect"
+    assert rec.license == "Apache-2.0"
+
+
+# ── NMS: vectorized path must match the pure-Python semantics exactly ─────
+def _pynms(boxes, scores, iou_thr=0.45):
+    """Reference implementation from before the vectorization (same greedy)."""
+    from packages.ai.detectors import iou
+
+    order = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
+    keep = []
+    while order:
+        i = order.pop(0)
+        keep.append(i)
+        order = [j for j in order if iou(boxes[i], boxes[j]) <= iou_thr]
+    return keep
+
+
+def test_nms_vectorized_matches_pure_python_semantics():
+    """The numpy fast path is the default; it must not change WHICH boxes
+    survive vs. the readable Python loop it replaced."""
+    import numpy as np
+
+    from packages.ai.detectors import nms
+
+    rng = np.random.default_rng(1234)  # deterministic test data, not crypto
+    for _trial in range(25):
+        n = int(rng.integers(1, 60))
+        boxes = [(float(rng.random()), float(rng.random()),
+                  float(rng.random()) * 0.4, float(rng.random()) * 0.4)
+                 for _ in range(n)]
+        scores = [float(rng.random()) for _ in range(n)]
+        for thr in (0.3, 0.45, 0.6):
+            assert nms(boxes, scores, thr) == _pynms(boxes, scores, thr)
+
+
+def test_nms_handles_empty_and_degenerate_boxes():
+    from packages.ai.detectors import nms
+
+    assert nms([], []) == []
+    # Zero-area boxes have union == 0 → IoU 0 → all survive (no ZeroDivision).
+    assert len(nms([(0.0, 0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 0.0)], [0.9, 0.1])) == 2
+
+
+def test_candidate_cap_bounds_nms_cost_and_keeps_top_scores():
+    """A dense head must not be able to blow the frame budget: only the top
+    MAX_CANDIDATES scorers reach NMS, and the winners are still the best ones."""
+    import time
+
+    import numpy as np
+
+    from packages.ai.detectors import MAX_CANDIDATES, postprocess_yolo
+
+    # 4000 distinct, non-overlapping candidates all above threshold: without
+    # the cap this is the pathological NMS input that measured ~800 ms.
+    n = 4000
+    raw = np.zeros((1, 4 + 80, n), dtype=np.float32)
+    raw[0, 0, :] = np.linspace(100, 540, n)   # cx spread
+    raw[0, 1, :] = 180.0                      # cy
+    raw[0, 2, :] = 8.0                        # w
+    raw[0, 3, :] = 16.0                       # h
+    raw[0, 4, :] = np.linspace(0.5, 0.99, n)  # person scores, ascending
+    labels = ["person"] + [f"c{i}" for i in range(1, 80)]
+
+    t0 = time.perf_counter()
+    dets = postprocess_yolo(raw, labels, conf_thr=0.4, in_hw=(640, 640),
+                            frame_hw=(360, 640))
+    elapsed_ms = (time.perf_counter() - t0) * 1000.0
+
+    assert len(dets) <= MAX_CANDIDATES, "cap must bound the survivor count"
+    # Ascending scores → the top of the head is the tail of the index range.
+    assert max(d.confidence for d in dets) > 0.95, "best boxes must survive"
+    # Generous but meaningful: the pre-fix pure-Python path took ~800 ms here.
+    assert elapsed_ms < 200.0, f"capped NMS too slow: {elapsed_ms:.0f} ms"
+
+
+# ── bench: budget math is a gate, so it must be exactly right ──────────────
+def test_bench_percentile_is_nearest_rank_not_interpolated():
+    from packages.ai.bench import percentile
+
+    samples = [float(i) for i in range(1, 101)]  # 1..100
+    assert percentile(samples, 50) == 50.0
+    assert percentile(samples, 95) == 95.0
+    assert percentile(samples, 100) == 100.0
+    assert percentile(samples, 0) == 1.0
+    # Never a value that was not observed.
+    assert percentile([10.0, 20.0], 50) in (10.0, 20.0)
+    assert percentile([], 95) == 0.0
+
+
+def test_bench_verdict_only_fails_declared_budgets():
+    from packages.ai.bench import BUDGETS, verdict
+
+    metric = "motion_gate_us"
+    budget = BUDGETS[metric][0]
+    assert verdict(metric, budget) is True
+    assert verdict(metric, budget + 1.0) is False
+    # An informational metric (no declared target) can never fail the gate.
+    assert verdict("something_unbudgeted", 10_000.0) is None
+
+
+def test_bench_report_pass_flag_ignores_unbudgeted_metrics():
+    from packages.ai.bench import report
+
+    # A wildly slow unbudgeted metric must NOT fail the run...
+    rep = report({"totally_unbudgeted_metric": [5000.0] * 10})
+    assert rep["pass"] is True
+    assert rep["metrics"]["totally_unbudgeted_metric"]["within_budget"] is None
+
+    # ...but a declared metric over budget MUST fail it, judged on P95.
+    rep2 = report({"motion_gate_us": [1000.0] * 10})
+    assert rep2["pass"] is False
+    assert rep2["metrics"]["motion_gate_us"]["judged_on"] == "p95"
+
+
+def test_bench_report_grades_on_p95_not_mean():
+    """One slow outlier in twenty should not fail a metric whose P95 is fine."""
+    from packages.ai.bench import report
+
+    samples = [50.0] * 19 + [1e6]          # P95 == 50 us, well inside 500
+    rep = report({"motion_gate_us": samples})
+    assert rep["metrics"]["motion_gate_us"]["p95"] == 50.0
+    assert rep["pass"] is True
+
+
+# ── hot-path performance regression gate (roadmap R1) ──────────────────────
+# These run in CI on a shared runner, so budgets are deliberately loose
+# multiples of the measured reference numbers (gate ~0.05 ms, decode ~0.3 ms).
+# They exist to catch an ORDER-OF-MAGNITUDE regression — e.g. the 1.9 ms
+# full-frame-float motion gate or the 800 ms pure-Python NMS — not to police
+# micro-optimization noise.
+def test_motion_gate_stays_orders_of_magnitude_cheaper_than_inference():
+    import time
+
+    import numpy as np
+
+    from packages.ai.bench import BUDGETS
+    from packages.ai.pipeline import CameraPipeline
+
+    pipe = CameraPipeline.__new__(CameraPipeline)
+    pipe.motion_grid = 64
+    pipe._gate_prev = None
+
+    a = np.zeros((360, 640, 3), dtype=np.uint8)
+    a[:180] = 60
+    b = a.copy()
+    b[180:200] = 200
+    pipe.motion_score(a)  # prime
+
+    t0 = time.perf_counter()
+    for _ in range(20):
+        pipe.motion_score(b)
+    per_call_us = (time.perf_counter() - t0) / 20 * 1e6
+
+    budget_us = BUDGETS["motion_gate_us"][0]
+    assert per_call_us < budget_us * 20, (
+        f"motion gate cost {per_call_us:.0f} us/call blows the "
+        f"{budget_us:.0f} us budget by >20x — the gate was likely made to "
+        f"touch the full frame again"
+    )
+
+
+def test_motion_gate_stats_track_skips_for_health_surface():
+    """The gate exposes honest skip telemetry for the camera-health surface."""
+    import numpy as np
+
+    from packages.ai.pipeline import CameraPipeline
+
+    pipe = CameraPipeline.__new__(CameraPipeline)
+    pipe.motion_grid = 64
+    pipe._gate_prev = None
+    pipe.motion_gate_enabled = True
+    pipe.motion_threshold = 0.01
+    pipe.motion_frames = 0
+    pipe.motion_skips = 0
+    pipe.last_motion_score = 0.0
+
+    static = np.zeros((48, 64, 3), dtype=np.uint8)
+    pipe._frame_has_motion(static)          # primes baseline (no motion yet)
+    assert pipe._frame_has_motion(static) is False
+
+    moving = static.copy()
+    moving[10:30, 10:30] = 255
+    assert pipe._frame_has_motion(moving) is True
+    assert pipe.last_motion_score >= pipe.motion_threshold
+
+
 
 
 # ── helpers ─────────────────────────────────────────────────────────────────

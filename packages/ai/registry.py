@@ -22,6 +22,15 @@ class ModelRecord:
     hash_sha256: str
     source: str = ""
     license: str = ""
+    # Optional metadata (roadmap A1/A2). Defaulted so older registry files and
+    # operator-staged records keep loading unchanged.
+    #   task      — detect | classify | embed | ocr | pose | prompts
+    #   quantized — True for INT8/FP16 post-training-quantized artifacts, so
+    #               the operator and the bench harness can tell a full-precision
+    #               artifact from an edge-optimized one without guessing from
+    #               the filename.
+    task: str = "detect"
+    quantized: bool = False
 
 
 class ModelRegistry:
