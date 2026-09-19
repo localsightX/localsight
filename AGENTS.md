@@ -55,7 +55,17 @@ tests/           unit + security + API + integration; tests/ui = Playwright e2e
      before storage.
    - Media delivery → app-relative signed URLs (`/api/video/...?exp=...&sig=...`),
      HMAC-SHA256 over `key:exp` with the master key. Never return absolute S3
-     URLs to a client; the app proxies remote objects.
+     URLs to a client; the app proxies remote objects. Signed-URL TTLs are
+     **capped at 1 h on both sign and verify** (`max(1, min(expires_sec, 3600))`
+     and `exp ≤ now+3660`) — a signed URL is a bearer credential, not a public
+     link; a leaked signer must not be able to mint permanent URLs. Media bytes
+     stream through `StorageProvider.size()` + `read_range()` (HTTP Range,
+     206/416) — never buffer a segment into the heap.
+   - Alert route destinations (webhook/mqtt/push/smtp) are SSRF-gated at
+     **create time** (`_validate_route_destination`): webhooks through the full
+     URL validator, host-bearing channels through a synthetic `https://host`
+     probe. No fixture carve-outs — 127.0.0.1 is rejected unless the operator
+     explicitly allowlists loopback.
    - Webhook/email/MQTT payloads → filter `Event.detail` through
      `_ALERT_DETAIL_KEYS` (worker) — ciphertext (`plate_enc`) never goes to
      third-party channels.
@@ -133,9 +143,9 @@ tests/           unit + security + API + integration; tests/ui = Playwright e2e
 
 - **Dev**: SQLite, tests run against an in-memory-ish session-scoped app
   (`conftest.py`); `.venv` at repo root; `pytest tests/ -q` must pass
-  (**currently 111 tests**, up from 97 — `test_surveillance.py` carries 64 of
-  them). The UI e2e suite is separate: `pytest tests/ui -m ui` collects 43
-  more (154 total) — it boots a real uvicorn server + seeded throwaway DB and
+  (**currently 125 tests**, up from 111 — `test_surveillance.py` carries 68 of
+  them). The UI e2e suite is separate: `pytest tests/ui -m ui` collects 45
+  more (170 total) — it boots a real uvicorn server + seeded throwaway DB and
   drives it with Playwright (needs `playwright`, `pytest-playwright`,
   chromium, ffmpeg); `pytest tests/` never collects it (deselected via the `ui`
   marker, pytest.ini).
@@ -168,6 +178,30 @@ tests/           unit + security + API + integration; tests/ui = Playwright e2e
   OFFLINE forever even while streaming.
 - **Prod (compose)**: PostgreSQL + pgvector, `DATABASE_URL=postgresql+psycopg://`
   (driver installed via `requirements-prod.txt`), nginx TLS frontend.
+- **Security hardening invariants (PR #23)** — these are load-bearing, don't
+  soften them:
+  - `TRUST_PROXY_HEADERS` (default **false**): `X-Forwarded-For` is
+    attacker-controlled input. `client_ip()` keys rate limits and audit
+    `source_ip` on the **socket address** unless the flag is set; behind the
+    shipped nginx front (which *appends* the socket addr to any incoming
+    header) set `TRUST_PROXY_HEADERS=1` to use the **last** hop — never the
+    first, which the client itself controls.
+  - SSRF validation normalizes before deciding: exotic IPv4 spellings
+    (decimal `2130706433`, hex `0x7f.0.0.1`, octal `0177.0.0.1`, short
+    inet_aton forms) are canonicalized to dotted-quad, and IPv4-mapped IPv6
+    literals (`::ffff:10.0.0.5`) are unwrapped (`_normalize_ip_literal` /
+    `_canonical` in `packages/security/ssrf.py`) — both would otherwise
+    bypass the private-range blocklist. Literal IPs are pre-checked even when
+    the local resolver maps them elsewhere (macOS/Windows resolve
+    `0177.0.0.1` to `177.0.0.1`).
+  - Bootstrap admin seeding **refuses to start** without a strong
+    `BOOTSTRAP_ADMIN_PASSWORD` (≥12 chars); `scripts/gen_env.py` mints a
+    random one and prints it once. There is no default password.
+  - The rate limiter caps its bucket table (`max_buckets=10000`) and
+    opportunistically evicts fully-refilled buckets — an unauthenticated
+    attacker minting distinct source IPs must not grow memory unbounded.
+  - Login bodies are length-bounded (`email ≤320`, `password ≤256`,
+    `mfa_code ≤16`) — bound the Argon2 verify input.
 - **Schema evolution**: `Base.metadata.create_all` + `bootstrap._ensure_columns`
   for additive columns on existing tables. Each ALTER runs in its own
   transaction; only "duplicate column"/"already exists" errors are swallowed.
@@ -192,7 +226,11 @@ tests/           unit + security + API + integration; tests/ui = Playwright e2e
   server-side; TOTP MFA (stdlib, RFC 6238).
 - Login always performs exactly ONE Argon2 verify (fixed `_DUMMY_HASH` for
   nonexistent accounts) — do not "optimize" this into a branch skip; it's the
-  user-enumeration defense.
+  user-enumeration defense. **Order matters**: the password verify (or dummy
+  verify) runs BEFORE the lockout report — computing `locked` first and
+  returning 423 pre-verify leaked account existence (fast 401 vs slow 423).
+  Login/refresh/logout bodies are length-bounded (`email ≤320`,
+  `password ≤256`, `mfa_code ≤16`).
 - Account lifecycle endpoints (all backing the Account view, wave M2):
   `POST /api/auth/password` (rotates, revokes other sessions),
   `GET /api/auth/sessions` + `POST /api/auth/sessions/{token_id}/revoke`,
@@ -205,15 +243,19 @@ tests/           unit + security + API + integration; tests/ui = Playwright e2e
   another user's sessions. Deleting a user is typed-email confirm.
 - RBAC: roles → permissions (`packages/security/rbac.py`); endpoints declare
   `require_permission("...")`. Permission names live in the RBAC tables.
-- Rate limiting: in-process token bucket keyed by client IP; `X-Forwarded-For`
-  is only honored where a trusted proxy front sits.
+- Rate limiting: in-process token bucket keyed by `client_ip()` — the socket
+  address by default; the **last** `X-Forwarded-For` hop only when
+  `TRUST_PROXY_HEADERS=1` (the shipped nginx appends the socket addr, so the
+  last entry is the only client-unspoofable one). The bucket table is capped
+  at 10000 entries with eviction of fully-refilled buckets (memory-bound
+  under source-IP rotation).
 
 ## Quality gates
 
-- `pytest tests/ -q` — all green (**111 passed**, 43 deselected) in ~45 s.
+- `pytest tests/ -q` — all green (**125 passed**, 45 deselected) in ~45 s.
 - `pytest tests/ui -m ui` — the browser suite (Wave 5 + maturity waves); run it
   before merging UI changes (needs chromium via `playwright install`, ffmpeg).
-  43 tests: journeys (12), a11y/axe, CSP console, design tokens, flows,
+  45 tests: journeys (12), a11y/axe, CSP console, design tokens, flows,
   perf budgets, 12-state visual regression.
 - `ruff check .` — `ruff.toml` defines the rule set; keep changed files clean,
   don't mass-reformat untouched files.
