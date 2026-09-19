@@ -67,6 +67,12 @@ class Settings(BaseSettings):
     # Behavior analytics (rule engine) + ANPR are opt-in features.
     ai_rules_enabled: bool = True
     ai_anpr_enabled: bool = False
+    # Clothing-attribute tagging ("jacket", hi-vis, colors, backpack, hat) —
+    # non-biometric appearance tags for search/alert context. Opt-in like
+    # ANPR; sampled per person track (never per frame) when the bbox is large
+    # enough to carry clothing signal.
+    ai_attributes_enabled: bool = False
+    ai_attribute_interval_sec: float = 5.0
     # Recording of the main stream (segmented, HLS-ready).
     record_enabled: bool = True
     record_segment_seconds: int = 300

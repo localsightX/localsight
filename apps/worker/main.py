@@ -22,7 +22,8 @@ from collections.abc import Callable
 
 from apps.api.bootstrap import build
 from apps.api.config import Settings
-from packages.ai.anpr import ANPRPipeline, ReferencePlateDetector, ReferencePlateOCR
+from packages.ai.anpr import build_anpr
+from packages.ai.attributes import build_attribute_tagger
 from packages.ai.detectors import build_detector
 from packages.ai.face import ReferenceEmbedder, ReferenceFaceDetector
 from packages.ai.interfaces import Detector
@@ -333,6 +334,20 @@ def make_face_chain(settings: Settings, registry):
     return (ReferenceFaceDetector(), ReferenceEmbedder())
 
 
+def make_anpr(settings: Settings, registry):
+    """ANPR chain for a camera pipeline: None when the feature is off; the
+    staged ONNX plate-detector+OCR when verified; the reference chain (logged
+    downgrade) when enabled but unstaged. Never raises — ANPR is optional."""
+    return build_anpr(registry, enabled=settings.ai_anpr_enabled, conf_thr=0.6)
+
+
+def make_attribute_tagger(settings: Settings, registry):
+    """Clothing-attribute tagger (jacket/hi-vis/colors): staged CLIP zero-shot
+    encoder + prompt embeddings when verified; deterministic reference tagger
+    (logged downgrade) otherwise; None when the feature is off."""
+    return build_attribute_tagger(registry, enabled=settings.ai_attributes_enabled)
+
+
 def build_make_source(camera: Camera, settings: Settings, crypto,
                       allowlist: list[str] | None = None):
     sub_url = camera.substream_url_enc
@@ -350,8 +365,10 @@ def build_make_source(camera: Camera, settings: Settings, crypto,
 
 # Detail keys safe to serialize to third-party channels (webhook/email/MQTT).
 # Never includes ciphertext (plate_enc) or anything derived from biometrics;
-# consumers get the minimal operational context only.
-_ALERT_DETAIL_KEYS = ("direction", "dwell_sec", "count", "zone", "stationary_sec")
+# consumers get the minimal operational context only. `attributes` carries
+# non-biometric appearance tags (jacket/color) — operational context, safe.
+_ALERT_DETAIL_KEYS = ("direction", "dwell_sec", "count", "zone", "stationary_sec",
+                      "attributes")
 
 
 def _safe_alert_detail(detail: dict | None) -> dict:
@@ -419,9 +436,8 @@ def run_camera(rt, camera: Camera, stop: threading.Event) -> None:
     rule_engine = None
     if settings.ai_rules_enabled:
         rule_engine = rule_engine_from_json(camera.id, camera.rules)
-    anpr = None
-    if settings.ai_anpr_enabled:
-        anpr = ANPRPipeline(ReferencePlateDetector(), ReferencePlateOCR(), conf_thr=0.6)
+    anpr = build_anpr(rt.registry, enabled=settings.ai_anpr_enabled, conf_thr=0.6)
+    attribute_tagger = make_attribute_tagger(settings, rt.registry)
 
     pipeline = CameraPipeline(
         camera.id, detector, tracker, face_chain, matcher, rt.SessionLocal, rt.storage, rt.crypto,
@@ -432,6 +448,8 @@ def run_camera(rt, camera: Camera, stop: threading.Event) -> None:
         identity_recognition_enabled=settings.ai_identity_recognition_enabled,
         rule_engine=rule_engine,
         anpr=anpr,
+        attributes=attribute_tagger,
+        attribute_interval_sec=settings.ai_attribute_interval_sec,
         privacy_masks=camera.privacy_masks,
         motion_gate_enabled=settings.ai_motion_gate_enabled,
     )

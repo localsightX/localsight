@@ -309,6 +309,87 @@ sanity check, not production.
 | `RuntimeError: unknown AI_DETECTOR backend` | Typo in `AI_DETECTOR` | Use `reference`, `onnx`, `tensorrt`, `openvino`, or `tflite` |
 | Camera `OFFLINE` after switching to ONNX | Worker can't init session | Check worker logs; verify `models/` is mounted in Docker |
 
+## Staging the ANPR chain (plate_detector + plate_ocr)
+
+ANPR is opt-in (`AI_ANPR_ENABLED=1`). With no staged models the pipeline logs a
+downgrade and uses the reference chain (honest placeholder). The production
+chain is two operator-staged, hash-verified ONNX models:
+
+| Registry name | Artifact | Suggested source | License class |
+|---|---|---|---|
+| `plate_detector` | single-class YOLO detect export ("plate") | operator fine-tune (e.g. CCPD/Open-Images-derived) | verify per artifact |
+| `plate_ocr` | CTC (CRNN/SVTR) recognizer, input `1×3×48×W` | PaddleOCR PP-OCRv4 rec export (convention built in: /255 → (x−0.5)/0.5, BGR, h=48, width ≤320 pad-right) | **Apache-2.0** |
+| `plate_charset` (optional) | text file, one char per line, blank at CTC index 0 | from the OCR training dict | — |
+
+```bash
+python scripts/stage_model.py --name plate_detector --path models/staged/plate-det.onnx \
+    --source "operator-trained YOLO plate detector" --license "see artifact"
+python scripts/stage_model.py --name plate_ocr --path models/staged/ppocr-rec.onnx \
+    --source "PaddleOCR PP-OCRv4 rec (ONNX export)" --license "Apache-2.0"
+```
+
+Both must verify (hash match) or the factory downgrades. CTC decode is greedy
+over the argmax sequence (blank=0, repeats collapsed). Privacy: plate text is
+envelope-encrypted (`plate_enc`); the searchable index is an **HMAC-SHA256
+bound to the master key** (`plate_hash`) — never a bare SHA-256, which a
+stolen DB could brute-force over the tiny plate keyspace.
+
+## Staging the attribute chain (attribute_encoder + attribute_prompts)
+
+Clothing attributes ("jacket", hi-vis, colors, backpack, hat) are CLIP
+zero-shot: person-track crops are embedded by a staged CLIP image-encoder ONNX
+and compared against prompt vectors generated **once** from the same
+checkpoint (MIT-licensed OpenAI CLIP ViT-B/32 is a known-good source). The
+vocabulary is an operator-editable JSON — new attributes need no retraining.
+
+| Registry name | Artifact | Notes |
+|---|---|---|
+| `attribute_encoder` | CLIP image encoder, ONNX, 224×224 input | normalization baked to CLIP means/std |
+| `attribute_prompts` | `{"image_encoder_sha256": …, "groups": [{"group": "jacket", "items": [{"text", "label", "vector"}]}]}` | vectors L2-normalized at load; the loader **refuses a checkpoint/embedding mismatch** |
+
+Generate the prompt vectors once, operator-side (the AGPL/MS-licensing of the
+training environment is the operator's choice, LocalSight ships neither code
+nor weights):
+
+```python
+from PIL import Image
+import torch, open_clip   # example: open_clip (Apache-2.0)
+model, _, _ = open_clip.create_model_and_transforms("ViT-B-32", pretrained="openai")
+tokenizer = open_clip.get_tokenizer("ViT-B-32")
+texts = ["a photo of a person wearing a jacket", ...]  # keep groups aligned
+with torch.no_grad():
+    v = model.encode_text(tokenizer(texts))
+    v = (v / v.norm(dim=-1, keepdim=True)).tolist()
+```
+
+```bash
+python scripts/stage_model.py --name attribute_encoder --path models/staged/clip-image-enc.onnx \
+    --source "CLIP ViT-B/32 image encoder" --license "MIT"
+python scripts/stage_model.py --name attribute_prompts --path models/staged/attribute_prompts.json \
+    --source "prompt embeddings from the same checkpoint" --license "MIT"
+```
+
+## Performance gates (per-camera frame budget at `AI_INFERENCE_FPS=5`)
+
+| Stage | When | Cost control |
+|---|---|---|
+| Object detect | every sampled frame | motion gate (`AI_MOTION_GATE_ENABLED`), substream only |
+| Face chain (SCRFD+ArcFace) | per person track ≤ every 2 s | **far-field gate**: bbox height < 0.06 skips the whole chain |
+| ANPR (det+OCR) | per vehicle track ≤ every 5 s | vehicle-only, event emitted on plate change |
+| Attribute tagging | per person track ≤ every 5 s | person-only, bbox height ≥ 0.08 |
+
+All chains log a downgrade (reference fallback) instead of failing the camera
+— optional capabilities degrade loudly, the object detector fails closed.
+
+## Durability notes
+
+- SQLite (dev): WAL + `synchronous=NORMAL` — API reads never block behind
+  worker commits; commits survive app crashes. PostgreSQL is the prod answer.
+- `tracks.detail` (attribute tags) is additive via `bootstrap._ensure_columns`
+  and lives in JSON — swept with tracks/events by the retention sweep.
+- `plate_hash` tokens are master-key-bound; rotating
+  `MASTER_ENCRYPTION_KEY` invalidates existing hashes (re-index event).
+
 ## Security
 
 The ModelRegistry verifies SHA-256 of every model before load. This prevents:

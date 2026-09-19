@@ -994,6 +994,411 @@ def test_anpr_event_detail_persists_and_endpoints_serve(client):
     assert r2.status_code == 200, r2.text
 
 
+# ── ANPR ONNX chain + keyed plate hash (feat/anpr-attributes) ───────────────
+def test_ctc_greedy_decode_collapses_repeats_and_blank():
+    from packages.ai.anpr import DEFAULT_OCR_CHARSET, ctc_greedy_decode
+
+    cs = list(DEFAULT_OCR_CHARSET)  # idx 0 = blank; idx 1 → '0'; idx 11 → 'A'
+    assert ctc_greedy_decode([0, 11, 11, 0, 12], cs) == "AB"
+    assert ctc_greedy_decode([1, 1, 1], cs) == "0"  # repeats collapse
+    assert ctc_greedy_decode([999], cs) == ""  # out-of-range dropped
+    assert ctc_greedy_decode([], cs) == ""
+
+
+def test_onnx_plate_ocr_end_to_end_with_mock_session(monkeypatch):
+    """CTC logits spelling AB12CD decode through the full PlateOCR path,
+    including the PP-OCR-convention preprocessing shape."""
+    import sys
+    import types
+
+    import numpy as np
+
+    charset = list("0123456789ABCDEF")  # staged charset
+    target = [11, 12, 2, 3, 13, 14]  # "AB12CD"
+    T, C = 12, len(charset) + 1
+    logits = np.full((1, T, C), -10.0, dtype=np.float32)
+    logits[:, :, 0] = 5.0  # blank dominates everywhere…
+    for t, ci in enumerate(target):
+        logits[0, t, 0] = -10.0
+        logits[0, t, ci] = 5.0  # …except at the target steps
+
+    captured = {}
+
+    class _FakeSess:
+        def __init__(self, path, providers=None):
+            captured["providers"] = providers
+
+        def get_inputs(self):
+            return [type("I", (), {"name": "pixels"})()]
+
+        def run(self, _, feed):
+            captured["shape"] = list(feed["pixels"].shape)
+            return [logits]
+
+    fake_ort = types.ModuleType("onnxruntime")
+    fake_ort.InferenceSession = _FakeSess
+    fake_ort.get_available_providers = lambda: ["CPUExecutionProvider"]
+    monkeypatch.setitem(sys.modules, "onnxruntime", fake_ort)
+
+    from packages.ai.anpr import ANPRPipeline, OnnxPlateOCR
+
+    class _RectDet:
+        def detect(self, crop, ts):
+            return (0.2, 0.3, 0.6, 0.4)
+
+    ocr = OnnxPlateOCR("fake.onnx", charset)
+    frame = np.full((120, 240, 3), 128, dtype=np.uint8)
+    pipe = ANPRPipeline(_RectDet(), ocr)
+    reading = pipe.read(frame, dt.datetime.now(dt.UTC))
+    assert reading is not None and reading.plate == "AB12CD"
+    assert captured["shape"] == [1, 3, 48, 320]
+    assert "CPUExecutionProvider" in captured["providers"]
+
+
+def test_onnx_plate_detector_picks_best_detection():
+    """Wrapper returns the max-confidence plate rect and retargets frame_hw
+    to the actual crop dims; degenerate crops are None (never crash)."""
+    import numpy as np
+
+    from packages.ai.anpr import OnnxPlateDetector
+    from packages.ai.interfaces import Detection
+
+    det = OnnxPlateDetector("fake.onnx")
+
+    class _Impl:
+        frame_hw = (0, 0)
+
+        def detect(self, frame, ts):
+            return [Detection("plate", 0.6, (0.1, 0.1, 0.2, 0.2)),
+                    Detection("plate", 0.9, (0.3, 0.3, 0.4, 0.3))]
+
+    det._impl = _Impl()
+    frame = np.zeros((160, 320, 3), dtype=np.uint8)
+    assert det.detect(frame, None) == (0.3, 0.3, 0.4, 0.3)
+    assert det._impl.frame_hw == (160, 320)
+    assert det.detect(np.zeros((4, 4, 3), dtype=np.uint8), None) is None
+
+
+def test_build_anpr_disabled_none_and_downgrade_when_unstaged(tmp_path):
+    from packages.ai.anpr import ANPRPipeline, ReferencePlateDetector, build_anpr
+    from packages.ai.registry import ModelRegistry
+
+    reg = ModelRegistry(str(tmp_path / "registry.json"))
+    assert build_anpr(reg, enabled=False) is None
+    pipe = build_anpr(reg, enabled=True)  # nothing staged → logged downgrade
+    assert isinstance(pipe, ANPRPipeline)
+    assert isinstance(pipe.detector, ReferencePlateDetector)
+
+
+def test_build_anpr_downgrades_on_hash_mismatch(tmp_path):
+    import json as _json
+
+    from packages.ai.anpr import ReferencePlateDetector, build_anpr
+    from packages.ai.registry import ModelRegistry
+
+    (tmp_path / "det.onnx").write_bytes(b"fake-det")
+    (tmp_path / "ocr.onnx").write_bytes(b"fake-ocr")
+    reg_path = tmp_path / "registry.json"
+    reg_path.write_text(_json.dumps({"models": [
+        {"name": "plate_detector", "version": "latest",
+         "path": str(tmp_path / "det.onnx"), "hash_sha256": "0" * 64,
+         "source": "t", "license": "t"},
+        {"name": "plate_ocr", "version": "latest",
+         "path": str(tmp_path / "ocr.onnx"), "hash_sha256": "0" * 64,
+         "source": "t", "license": "t"},
+    ]}))
+    reg = ModelRegistry(str(reg_path))
+    pipe = build_anpr(reg, enabled=True)
+    assert isinstance(pipe.detector, ReferencePlateDetector)
+
+
+def test_cryptobox_hmac_str_is_keyed_and_deterministic():
+    from cryptography.fernet import Fernet
+
+    from packages.security.crypto import CryptoBox
+
+    key = Fernet.generate_key().decode()
+    a, b = CryptoBox(key), CryptoBox(key)
+    assert a.hmac_str("AB12CD") == b.hmac_str("AB12CD")
+    assert a.hmac_str("AB12CD") != a.hmac_str("AB12CE")
+    assert CryptoBox(Fernet.generate_key().decode()).hmac_str("AB12CD") \
+        != a.hmac_str("AB12CD")
+    assert len(a.hmac_str("AB12CD")) == 32
+
+
+def test_pipeline_anpr_event_uses_keyed_plate_hash():
+    """The ANPR event path writes an envelope + master-key-bound plate hash —
+    never a bare SHA-256 (plates are a tiny brute-forceable keyspace)."""
+    import hashlib
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from cryptography.fernet import Fernet
+
+    from packages.ai.anpr import (ANPRPipeline, ReferencePlateDetector,
+                                  ReferencePlateOCR)
+    from packages.ai.pipeline import CameraPipeline
+    from packages.ai.tracker import IouTracker
+    from packages.domain.models import Base, Event
+    from packages.security.crypto import CryptoBox
+
+    class _VehDet:
+        def detect(self, frame, ts):
+            from packages.ai.interfaces import Detection
+            return [Detection(label="vehicle", confidence=0.9,
+                              bbox=(0.1, 0.1, 0.5, 0.4))]
+
+    class _Storage:
+        def put(self, *a):
+            pass
+
+    eng = create_engine("sqlite:///:memory:", future=True)
+    Base.metadata.create_all(eng)
+    S = sessionmaker(bind=eng, future=True)
+    crypto = CryptoBox(Fernet.generate_key().decode())
+    pipe = CameraPipeline(
+        "cam-anpr", _VehDet(), IouTracker(), None, None, S, _Storage(), crypto,
+        anpr=ANPRPipeline(ReferencePlateDetector(),
+                          ReferencePlateOCR(seed_plate="AB12CDE")),
+    )
+    ts = dt.datetime(2026, 1, 1, tzinfo=dt.UTC)
+    with S() as s:
+        pipe.process_frame(s, None, ts)
+        s.commit()
+        # ANPR events are point-in-time: session-added + _last_analytic, not
+        # in the closed-tracks return value.
+        ev = s.query(Event).filter(Event.event_type == "anpr").one()
+        assert ev.detail["plate_hash"] == crypto.hmac_str("AB12CDE")
+        assert ev.detail["plate_hash"] \
+            != hashlib.sha256(b"AB12CDE").hexdigest()[:16]
+        assert ev.detail["plate_enc"]  # envelope present
+
+
+# ── clothing attributes ("jacket") + face far-field gate ────────────────────
+def test_reference_attribute_tagger_deterministic():
+    import numpy as np
+
+    from packages.ai.attributes import ReferenceAttributeTagger
+
+    t = ReferenceAttributeTagger()
+    crop = np.zeros((80, 40, 3), dtype=np.uint8)
+    crop[:40] = 200  # bright upper half
+    crop[40:] = 20   # dark lower half → not "jacketed" by the heuristic
+    a, b = t.tag(crop), t.tag(crop)
+    assert a == b and a["jacket"] is False and a["source"] == "reference"
+    assert t.tag(None) == {}  # non-array input → no tags, no crash
+
+
+def test_build_attribute_tagger_disabled_none_and_downgrade(tmp_path):
+    from packages.ai.attributes import (ReferenceAttributeTagger,
+                                        build_attribute_tagger)
+    from packages.ai.registry import ModelRegistry
+
+    reg = ModelRegistry(str(tmp_path / "registry.json"))
+    assert build_attribute_tagger(reg, enabled=False) is None
+    assert isinstance(build_attribute_tagger(reg, enabled=True),
+                      ReferenceAttributeTagger)
+
+
+def test_clip_attribute_tagger_zero_shot_and_mismatch_refusal(tmp_path, monkeypatch):
+    import hashlib as _hl
+    import json as _json
+    import sys
+    import types
+
+    import numpy as np
+    import pytest
+
+    enc_path = tmp_path / "enc.onnx"
+    enc_path.write_bytes(b"weights")
+    prompts = {
+        "image_encoder_sha256": _hl.sha256(b"weights").hexdigest(),
+        "groups": [
+            {"group": "jacket", "items": [
+                {"text": "wearing a jacket", "label": "yes", "vector": [1, 0, 0]},
+                {"text": "not wearing a jacket", "label": "no", "vector": [-1, 0, 0]},
+            ]},
+            {"group": "color", "items": [
+                {"text": "red clothing", "label": "red", "vector": [0, 1, 0]},
+                {"text": "blue clothing", "label": "blue", "vector": [0, -1, 0]},
+            ]},
+        ],
+    }
+    ppath = tmp_path / "prompts.json"
+    ppath.write_text(_json.dumps(prompts))
+
+    class _FakeSess:
+        def __init__(self, path, providers=None):
+            pass
+
+        def get_inputs(self):
+            return [type("I", (), {"name": "img"})()]
+
+        def run(self, _, feed):
+            # embedding pointing equally at jacket-yes and red
+            return [np.array([[1.0, 1.0, 0.0]], dtype=np.float32)]
+
+    fake_ort = types.ModuleType("onnxruntime")
+    fake_ort.InferenceSession = _FakeSess
+    fake_ort.get_available_providers = lambda: ["CPUExecutionProvider"]
+    monkeypatch.setitem(sys.modules, "onnxruntime", fake_ort)
+
+    from packages.ai.attributes import ClipAttributeTagger
+
+    tagger = ClipAttributeTagger(str(enc_path), str(ppath))
+    tags = tagger.tag(np.zeros((64, 64, 3), dtype=np.uint8))
+    assert tags["jacket"] == "yes" and tags["jacket_conf"] > 0.99
+    assert tags["color"] == "red"
+
+    # embedding-space mismatch (prompts from another checkpoint) → refused
+    prompts["image_encoder_sha256"] = "0" * 64
+    ppath.write_text(_json.dumps(prompts))
+    with pytest.raises(RuntimeError, match="different CLIP checkpoint"):
+        ClipAttributeTagger(str(enc_path), str(ppath))
+
+
+def test_pipeline_attributes_sampled_persisted_and_throttled():
+    """Person tracks get tags on Track.detail and presence Event.detail; the
+    tagger fires at most once per interval; attribute state is pruned when
+    tracks age out."""
+    import numpy as np
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    from packages.ai.attributes import ReferenceAttributeTagger
+    from packages.ai.pipeline import CameraPipeline
+    from packages.ai.tracker import IouTracker
+    from packages.domain.models import Base, Track
+
+    class _Det:
+        def detect(self, frame, ts):
+            from packages.ai.interfaces import Detection
+            if frame is None:
+                return []  # person gone → track closes
+            return [Detection(label="person", confidence=0.95,
+                              bbox=(0.3, 0.3, 0.2, 0.3))]
+
+    class _Storage:
+        def put(self, *a):
+            pass
+
+    class _Crypto:
+        def encrypt_str(self, s):
+            return s
+
+        def decrypt_json(self, t):
+            return [0.1] * 128
+
+    class _CountingTagger(ReferenceAttributeTagger):
+        def __init__(self):
+            self.calls = 0
+
+        def tag(self, crop):
+            self.calls += 1
+            return super().tag(crop)
+
+    eng = create_engine("sqlite:///:memory:", future=True)
+    Base.metadata.create_all(eng)
+    S = sessionmaker(bind=eng, future=True)
+    ts0 = dt.datetime(2026, 1, 1, tzinfo=dt.UTC)
+    frame = np.zeros((360, 640, 3), dtype=np.uint8)
+
+    tagger = _CountingTagger()
+    pipe = CameraPipeline(
+        "cam-attr", _Det(), IouTracker(), None, None, S, _Storage(), _Crypto(),
+        attributes=tagger,
+    )
+    with S() as s:
+        pipe.process_frame(s, frame, ts0)
+        s.commit()
+        track_detail = s.query(Track).filter(Track.camera_id == "cam-attr").one().detail
+    assert tagger.calls == 1
+    assert track_detail and track_detail["jacket"] is False
+
+    # 1 s later: inside the 5 s interval → no re-tag
+    with S() as s:
+        pipe.process_frame(s, frame, ts0 + dt.timedelta(seconds=1))
+        s.commit()
+    assert tagger.calls == 1
+
+    # track closes → presence event carries the attributes context
+    with S() as s:
+        closed = pipe.process_frame(
+            s, None, ts0 + dt.timedelta(seconds=30))
+        s.commit()
+        closed_details = [e.detail for e in closed]
+    assert closed, "aging the track out must finalize a presence event"
+    assert closed_details[0] is not None \
+        and closed_details[0]["attributes"] == track_detail
+
+
+def test_pipeline_face_recognition_far_field_gate():
+    """Below _FACE_MIN_BBOX_H the whole SCRFD+embed chain is skipped (the
+    face would be <~24 px — no usable embedding); above it, recognition runs."""
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    from packages.ai.interfaces import Recognition
+    from packages.ai.pipeline import CameraPipeline
+    from packages.ai.tracker import IouTracker
+    from packages.domain.models import Base
+
+    class _FaceDet:
+        def __init__(self):
+            self.calls = 0
+
+        def detect(self, frame, person_bbox):
+            self.calls += 1
+            return (0.4, 0.4, 0.1, 0.1)
+
+    class _Embedder:
+        model_version = "ref-v0"
+
+        def embed(self, frame, face_bbox):
+            return [0.1] * 128
+
+    class _Matcher:
+        def search(self, vector, model_version, enrolled=None):
+            return Recognition(person_id=None, similarity=None, status="unknown")
+
+    class _Det:
+        def __init__(self, box):
+            self._box = box
+
+        def detect(self, frame, ts):
+            from packages.ai.interfaces import Detection
+            return [Detection(label="person", confidence=0.95, bbox=self._box)]
+
+    class _Storage:
+        def put(self, *a):
+            pass
+
+    class _Crypto:
+        def encrypt_str(self, s):
+            return s
+
+        def decrypt_json(self, t):
+            return [0.1] * 128
+
+    eng = create_engine("sqlite:///:memory:", future=True)
+    Base.metadata.create_all(eng)
+    S = sessionmaker(bind=eng, future=True)
+    ts = dt.datetime(2026, 1, 1, tzinfo=dt.UTC)
+
+    def _run(box):
+        fd = _FaceDet()
+        pipe = CameraPipeline(
+            "cam-gate", _Det(box), IouTracker(), (fd, _Embedder()), _Matcher(),
+            S, _Storage(), _Crypto(), identity_recognition_enabled=True,
+        )
+        with S() as s:
+            pipe.process_frame(s, None, ts)
+            s.commit()
+        return fd.calls
+
+    assert _run((0.3, 0.3, 0.1, 0.04)) == 0, "tiny person must skip the face chain"
+    assert _run((0.3, 0.3, 0.2, 0.3)) >= 1, "close person must hit the face chain"
+
+
 # ── regression: privacy masks suppress detection (report F-05) ─────────────
 def test_privacy_masks_suppress_detections():
     """A detection inside a privacy mask must never produce a track or event;

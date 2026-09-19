@@ -29,10 +29,27 @@ class CryptoBox:
     def __init__(self, master_key: str):
         if not master_key:
             raise CryptoError("MASTER_ENCRYPTION_KEY is required and was empty")
+        self._key = master_key  # raw key retained for keyed hashes (HMAC below)
         try:
             self._kek = Fernet(master_key.encode() if isinstance(master_key, str) else master_key)
-        except Exception as exc:  # noqa: BLE001 - surface as our error
+        except Exception as exc:  # surface as our error
             raise CryptoError(f"invalid master key: {exc}") from exc
+
+    def hmac_str(self, text: str) -> str:
+        """Keyed HMAC-SHA256 (hex, first 32 chars) over `text`.
+
+        Deterministic equality-search token for low-entropy identifiers
+        (license plates): a bare SHA-256 over a plate's tiny keyspace is
+        brute-forceable offline, so the searchable form MUST be key-bound.
+        Same master key ⇒ same token; rotating the key invalidates existing
+        plate-hash indexes by design (treat as a re-index event).
+        """
+        import hashlib
+        import hmac as _hmac
+
+        return _hmac.new(
+            self._key.encode("utf-8"), text.encode("utf-8"), hashlib.sha256,
+        ).hexdigest()[:32]
 
     # ── low-level envelope ────────────────────────────────────────────────
     def _seal(self, plaintext: bytes) -> dict:
@@ -57,7 +74,7 @@ class CryptoBox:
     def decrypt_bytes(self, token: str) -> bytes:
         try:
             envelope = json.loads(base64.b64decode(token))
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             raise CryptoError("malformed ciphertext token") from exc
         return self._open(envelope)
 
