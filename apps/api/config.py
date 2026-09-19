@@ -57,6 +57,15 @@ class Settings(BaseSettings):
     # backends save full inference cost on static scenes. Disabled = always
     # run the detector.
     ai_motion_gate_enabled: bool = True
+    # Motion-gate v2 (roadmap A5): mean-absolute-delta threshold in [0,1] below
+    # which the detector is skipped for that frame. Raise it for noisy outdoor
+    # scenes (skip more), lower it for dim indoor scenes (miss less).
+    ai_motion_threshold: float = 0.004
+    # Disk-pressure pre-alarms (reliability plan F3). The worker's retention
+    # loop samples the media volume hourly and alerts once per level crossing;
+    # hysteresis prevents flapping after a sweep reclaims space.
+    disk_warn_pct: float = 0.80
+    disk_critical_pct: float = 0.90
     ai_recognize_interval_sec: float = 2.0
     ai_similarity_threshold: float = 0.85
     ai_model_name: str = "detector"
@@ -110,7 +119,8 @@ class Settings(BaseSettings):
             )
         if not self.master_encryption_key or self.master_encryption_key in placeholders:
             raise RuntimeError(
-                "MASTER_ENCRYPTION_KEY is missing or still a placeholder. Set a 32-byte base64 value."
+                "MASTER_ENCRYPTION_KEY is missing or still a placeholder. "
+                "Set a 32-byte base64 value."
             )
         if len(self.jwt_secret) < 16 or len(self.master_encryption_key) < 16:
             raise RuntimeError("JWT_SECRET / MASTER_ENCRYPTION_KEY are too short.")
