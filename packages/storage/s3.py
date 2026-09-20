@@ -42,6 +42,16 @@ class S3CompatibleStorage(StorageProvider):
         )
         self._secret = signing_secret.encode()
 
+    @property
+    def local_volume_path(self) -> str | None:
+        """Always None: object storage has no local volume to watch.
+
+        Explicit rather than inherited so the disk-pressure decision is visible
+        (the worker logs "monitoring inactive" and stays silent instead of
+        reporting the app's own disk as if it held the recordings).
+        """
+        return None
+
     def _full_key(self, key: str) -> str:
         return f"{self._prefix}/{key}" if self._prefix else key
 

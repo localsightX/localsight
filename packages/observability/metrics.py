@@ -25,6 +25,8 @@ class Metrics:
         "cpu_utilization": "CPU utilization percent",
         "ram_used_mb": "RAM used in MB",
         "storage_usage_percent": "Storage used percent",
+        "disk_used_ratio": "Fraction of the media volume in use (0-1)",
+        "disk_pressure_level": "Disk pressure level (0=ok, 1=warning, 2=critical)",
         "database_latency_ms": "Database query latency in ms",
         "api_latency_ms": "API request latency in ms",
         "queue_depth": "Inference queue depth",

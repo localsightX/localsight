@@ -196,7 +196,13 @@ def make_disk_monitor(rt):
     from packages.observability.disk import DiskPressureMonitor
 
     settings = rt.settings
-    path = getattr(rt.storage, "root", None) or None
+    # `local_volume_path` is the volume media actually lands on: the recordings
+    # root for local storage, None for object storage. This previously read
+    # `getattr(rt.storage, "root", None)`, but LocalFilesystemStorage keeps the
+    # path in `_root` — so the attribute never existed, the path was always
+    # None, and the monitor reported "no local volume" on the very backend that
+    # owns one: disk pressure was unobservable in every shipped deployment.
+    path = getattr(rt.storage, "local_volume_path", None) or None
     if path is None:
         log.info("disk pressure monitoring inactive: storage backend has no local volume")
     return DiskPressureMonitor(
