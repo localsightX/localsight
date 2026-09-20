@@ -3,7 +3,13 @@
 # requires (DATABASE_URL=postgresql+psycopg://...) plus optional-but-expected
 # runtime pieces (psutil for /api/system gauges). The base requirements.txt
 # stays SQLite/minimal for local dev.
+#
+# onnxruntime enables the staged-model AI backends (AI_DETECTOR=onnx, the
+# ONNX face chain, ANPR, CLIP attributes). The version here is the one the
+# staged artifacts are validated against; the models themselves are NOT in
+# the image (BYOM) — the operator mounts models/ read-only at runtime.
 -r requirements.txt
 
 psycopg[binary]==3.2.3
 psutil==6.1.0
+onnxruntime==1.29.0

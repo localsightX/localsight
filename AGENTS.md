@@ -31,8 +31,9 @@ ui/              vanilla-JS dashboard (served at /): views/ (dashboard, live +
                  wizard, analytics, people, alerts admin, users, audit, privacy,
                  account, login) and core/ (dom, api, router, palette, density,
                  shortcuts, telemetry, toast, states, format)
-models/          registry.json (name/path/SHA-256/source/license) + staged/
-                 (yolo11n-detect.onnx, faces/det_500m.onnx, faces/w600k_mbf.onnx)
+models/          registry.json (name/path/SHA-256/source/license). staged/
+                 weights are operator-provided and gitignored (BYOM):
+                 yolo11n-detect.onnx, faces/det_500m.onnx, faces/w600k_mbf.onnx
 infrastructure/  Dockerfile, compose stack, nginx, monitoring
 docs/            architecture, security, operations, integrations, api, reviews
 scripts/         gen_env.py, capacity.py, seed_dev_data.py, local_cctv_rig.py,
@@ -252,7 +253,7 @@ tests/           unit + security + API + integration; tests/ui = Playwright e2e
 
 ## Quality gates
 
-- `pytest tests/ -q` — all green (**125 passed**, 45 deselected) in ~45 s.
+- `pytest tests/ -q` — all green (**172 passed**, 45 deselected) in ~60 s.
 - `pytest tests/ui -m ui` — the browser suite (Wave 5 + maturity waves); run it
   before merging UI changes (needs chromium via `playwright install`, ffmpeg).
   45 tests: journeys (12), a11y/axe, CSP console, design tokens, flows,
@@ -297,10 +298,11 @@ tests/           unit + security + API + integration; tests/ui = Playwright e2e
 
 The interfaces are the contract; implementations are swapped, never "improved".
 
-**Real, staged, hash-verified (in-tree today):**
+**Real, staged, hash-verified (operator-staged; the repo ships no weights):**
 
-- **Object detection** — `ONNXDetector` running
-  `models/staged/yolo11n-detect.onnx` (Ultralytics YOLO11n, COCO-pretrained) via
+- **Object detection** — `ONNXDetector` running a staged Ultralytics YOLO11n
+  export (`models/staged/yolo11n-detect.onnx`, AGPL-3.0; gitignored BYOM
+  artifact — hash-declared in `models/registry.json`) via
   lazy `onnxruntime` (CUDA auto-detected; CoreML on Apple Silicon). Enable with
   `AI_DETECTOR=onnx` + `AI_MODEL_NAME=detector`. Both ultralytics export layouts
   are supported (row-major and the transposed v8/v11 head) and COCO labels are
@@ -313,7 +315,11 @@ The interfaces are the contract; implementations are swapped, never "improved".
   lawful basis required). `bootstrap.build` loads the staged chain for
   *enrollment* regardless of the flag, so enroll→recognize vectors are
   comparable even when recognition is switched on later (vectors only compare
-  within a model version — mixing embedders silently never matches).
+  within a model version — mixing embedders silently never matches). The
+  staged face weights come from the InsightFace model zoo, whose banner reads
+  "ALL models are available for non-commercial research purposes only" —
+  recorded verbatim in `models/registry.json`; commercial production use of
+  the face chain needs a license-cleared checkpoint swap (BYOM).
 
 **Reference placeholders (deterministic, not production-accurate):**
 

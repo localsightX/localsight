@@ -5,6 +5,23 @@ is `ONNXDetector`, which runs any ONNX-exported YOLO/RT-DETR model via
 `onnxruntime`. A `ReferenceMotionDetector` fallback ensures the full pipeline
 runs on CPU without a model.
 
+> **Where do the weights live? (BYOM)** The repo and the container ship
+> **zero** model weights: `models/staged/` is gitignored and excluded from
+> the Docker build context. The operator stages each artifact into
+> `models/staged/` (compose mounts `../../models` read-only) and registers
+> its SHA-256 in `models/registry.json`; `ModelRegistry.verify` refuses a
+> hash mismatch and nothing is fetched at runtime. Until an artifact is
+> staged, `AI_DETECTOR=onnx` fails closed and the pipeline logs a downgrade
+> to the reference detector.
+>
+> **License duty travels with the artifact.** YOLO11n exports are
+> AGPL-3.0 (Ultralytics — code *and* trained weights). The InsightFace
+> model-zoo checkpoints (SCRFD `det_500m`, `w600k_mbf`) are explicitly
+> "available for non-commercial research purposes only" per the zoo banner;
+> a commercial face-recognition deployment needs a license-cleared
+> alternative. The exact strings are recorded per artifact in
+> `models/registry.json`.
+
 ## Available backends
 
 | Backend | Runtime | GPU | Model file needed | Code |
