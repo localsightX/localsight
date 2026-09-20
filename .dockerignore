@@ -6,6 +6,12 @@
 !.env.example
 *.db
 *.db-journal
+# SQLite WAL sidecars: excluding `*.db` alone is not enough. WAL mode (on in
+# dev and in the UI e2e harness) keeps the *live database content* in the
+# -wal/-shm sidecars, so a multi-MB e2e WAL would ship the seeded users and
+# events it was written for inside a distributed image layer.
+*.db-wal
+*.db-shm
 # TLS material never ships inside an image layer (keys are secrets; the
 # compose stack mounts the certs read-only at runtime instead).
 *.key
@@ -28,6 +34,14 @@ coverage.xml
 htmlcov/
 docs/
 tests/
+# Dev-only test harness — pytest is never run inside the image — plus
+# regenerable audit/scan artifacts.
+conftest.py
+pytest.ini
+ui_audit/
+ui_maturity/
+ui_e2e_artifacts_*/
+.pw-browsers/
 ui/node_modules/
 *.egg-info/
 .venv*
@@ -39,3 +53,9 @@ ui/node_modules/
 # read-only at runtime (compose does this). Prevents an operator's local
 # staging from leaking AGPL/research-restricted checkpoints into a layer.
 models/staged/
+
+# Customer-confidential business material (market research, competitor
+# teardowns, pricing and phase plans). `COPY . /app` would otherwise bake the
+# entire strategy folder into a distributed image layer. This entry is
+# load-bearing: `roadmap/` is gitignored, so nothing else would stop it.
+roadmap/

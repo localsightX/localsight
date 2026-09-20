@@ -13,14 +13,18 @@ design) is the product — treat regressions against it as functional bugs, not
 style issues.
 
 ```
-apps/api/        FastAPI app: routers, bootstrap (runtime), config, deps
+apps/api/        FastAPI app: routers (search.py = forensic search + saved
+                 searches), bootstrap (runtime), config, deps
 apps/worker/     per-camera AI pipelines, recorder, retention, alert fan-out
 packages/domain/ ORM models, schemas, timeutil, events
 packages/security/ passwords, JWT, RBAC, crypto (envelope), SSRF, rate-limit, MFA, audit
 packages/ai/     detector/tracker/face/matcher interfaces + reference impls + pipeline
                  detectors.py (ONNX/TensorRT/OpenVINO/TFLite + COCO→platform label
-                 map), face_onnx.py (staged SCRFD detector + ArcFace embedder),
-                 registry.py (SHA-256 model staging), rules.py, anpr.py, vlm.py
+                 map, NMS-free YOLO26 head, provider/thread knobs), face_onnx.py
+                 (staged SCRFD detector + ArcFace embedder), anpr.py (staged plate
+                 detector + CTC OCR), attributes.py (CLIP zero-shot clothing/
+                 colour tagging), bench.py (latency percentiles for perf gates),
+                 registry.py (SHA-256 model staging), rules.py, vlm.py
 packages/video/  frame sources, safe FFmpeg argv builder, stream gateway,
                  onvif, presets, tplink.py (VIGI/Tapo URL builders), recorder
 packages/storage/ StorageProvider ABC + local + S3 implementations, signed URLs
@@ -36,7 +40,8 @@ models/          registry.json (name/path/SHA-256/source/license). staged/
                  yolo11n-detect.onnx, faces/det_500m.onnx, faces/w600k_mbf.onnx
 infrastructure/  Dockerfile, compose stack, nginx, monitoring
 docs/            architecture, security, operations, integrations, api, reviews
-scripts/         gen_env.py, capacity.py, seed_dev_data.py, local_cctv_rig.py,
+scripts/         gen_env.py, capacity.py, seed_dev_data.py, local_cctv_rig.py
+                 (incl. `bench`), bench_detector.py, stage_model.py,
                  ui_audit.py / ui_design_metrics.py / ui_maturity_scan.py /
                  ui_probe_flows.py / ui_probe_wave1..4.py (Playwright)
 tests/           unit + security + API + integration; tests/ui = Playwright e2e
@@ -144,9 +149,9 @@ tests/           unit + security + API + integration; tests/ui = Playwright e2e
 
 - **Dev**: SQLite, tests run against an in-memory-ish session-scoped app
   (`conftest.py`); `.venv` at repo root; `pytest tests/ -q` must pass
-  (**currently 125 tests**, up from 111 — `test_surveillance.py` carries 68 of
+  (**currently 187 tests** — `test_surveillance.py` carries 112 of
   them). The UI e2e suite is separate: `pytest tests/ui -m ui` collects 45
-  more (170 total) — it boots a real uvicorn server + seeded throwaway DB and
+  more (232 total) — it boots a real uvicorn server + seeded throwaway DB and
   drives it with Playwright (needs `playwright`, `pytest-playwright`,
   chromium, ffmpeg); `pytest tests/` never collects it (deselected via the `ui`
   marker, pytest.ini).
@@ -253,7 +258,7 @@ tests/           unit + security + API + integration; tests/ui = Playwright e2e
 
 ## Quality gates
 
-- `pytest tests/ -q` — all green (**172 passed**, 45 deselected) in ~60 s.
+- `pytest tests/ -q` — all green (**187 passed**, 45 deselected) in ~60 s.
 - `pytest tests/ui -m ui` — the browser suite (Wave 5 + maturity waves); run it
   before merging UI changes (needs chromium via `playwright install`, ffmpeg).
   45 tests: journeys (12), a11y/axe, CSP console, design tokens, flows,
@@ -307,7 +312,25 @@ The interfaces are the contract; implementations are swapped, never "improved".
   `AI_DETECTOR=onnx` + `AI_MODEL_NAME=detector`. Both ultralytics export layouts
   are supported (row-major and the transposed v8/v11 head) and COCO labels are
   remapped into the platform vocabulary by `_LabelMappedDetector`. The local
-  CCTV rig runs this by default.
+  CCTV rig runs this by default. The decoder also handles the **NMS-free
+  YOLO26 head** (`(batch, max_det, 6)` — class ids stay FP32-safe, which a
+  plain `.astype(int)` would corrupt) and honours `AI_DETECTOR_PROVIDER` /
+  `AI_ORT_INTRA_THREADS` so an operator can pin CPU vs CUDA/CoreML threads.
+- **Plate recognition (ANPR)** — `packages/ai/anpr.py`: `OnnxPlateDetector`
+  (single-class plate YOLO, reusing the production letterbox + both export
+  layouts) + `OnnxPlateOCR` (CTC/CRNN with PP-OCRv4-rec preprocessing baked
+  in: BGR, `/255 → (x-0.5)/0.5`, h=48, pad-right; optional staged charset
+  file). `build_anpr` is an *optional* capability → `None` when
+  `AI_ANPR_ENABLED` is off, logged downgrade to the reference chain when the
+  artifacts are absent.
+- **Clothing / colour attributes** — `packages/ai/attributes.py`:
+  `ClipAttributeTagger` embeds person crops against operator-generated prompt
+  embeddings (zero-shot — **adding an attribute is a JSON edit, not a
+  retrain**). The prompt file declares `image_encoder_sha256`, and the loader
+  refuses a checkpoint/embedding mismatch (a stale prompt file silently
+  produces garbage tags otherwise). Feeds `tracks.detail.attributes` and the
+  forensic-search endpoint. MIT (OpenAI CLIP) / Apache-2.0 (open_clip) —
+  no Ultralytics exposure.
 - **Identity recognition** — `packages/ai/face_onnx.py`: SCRFD 500M face
   detector + ArcFace MobileFaceNet embedder (`build_face_chain`: 5-point
   landmark alignment, 112×112, 512-d L2-normalized vectors, cosine band ~0.4–0.5),
@@ -328,8 +351,21 @@ The interfaces are the contract; implementations are swapped, never "improved".
 - `ReferenceFaceDetector` / `ReferenceEmbedder` — a deterministic image-hash
   embedding used when staged face models are absent (the worker logs a
   downgrade rather than failing).
-- ANPR OCR (`anpr.py`), VLM/CLIP semantic search (`vlm.py`), and appearance
-  ReID (tracking is SORT-style motion prediction only).
+- `ReferencePlateDetector` / `ReferencePlateOCR` — the deterministic fallback
+  chain behind `build_anpr` (regex-formed plate strings from the crop hash).
+- `ReferenceAttributeTagger` — the fallback behind
+  `build_attribute_tagger` (deterministic tags from the crop hash).
+- Appearance ReID (tracking is SORT-style motion prediction only) and
+  VLM/CLIP semantic search (`vlm.py` — the *image*-side CLIP encoder is real
+  in `attributes.py`; the text-side search path is still a placeholder).
+
+**Registry reality check**: `models/registry.json` currently declares only
+three artifacts (`detector`, `face_detector`, `face_embedder`). Plate
+detector/OCR, the attribute encoder + prompts, and the charset are **optional**
+names — `build_anpr` / `build_attribute_tagger` look them up and downgrade
+loudly when absent, so a stock checkout logs reference-mode plate/attribute
+tags rather than failing. Stage them with `scripts/stage_model.py` (see
+`docs/operations/onnx-detector.md`) to turn those stages on.
 
 Do NOT "fix" a reference implementation to be smarter — stage a model and swap
 it via the interfaces (rule 9). `docs/operations/onnx-detector.md` documents the
