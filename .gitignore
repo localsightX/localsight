@@ -45,3 +45,8 @@ infrastructure/nginx/certs/
 infrastructure/compose/demo.env
 .buildx/
 roadmap/
+
+# BYOM posture: weights are operator-staged supply-chain artifacts, never
+# committed or shipped (registry.json declares path+SHA-256; see rule 9 and
+# docs/operations/onnx-detector.md).
+models/staged/

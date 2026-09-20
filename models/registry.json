@@ -14,7 +14,7 @@
       "path": "models/staged/faces/det_500m.onnx",
       "hash_sha256": "5e4447f50245bbd7966bd6c0fa52938c61474a04ec7def48753668a9d8b4ea3a",
       "source": "https://github.com/deepinsight/insightface/releases/download/v0.7/buffalo_s.zip",
-      "license": "MIT (InsightFace SCRFD 500M)"
+      "license": "InsightFace model zoo: weights non-commercial research ONLY (zoo banner: 'ALL models are available for non-commercial research purposes only'); code MIT"
     },
     {
       "name": "face_embedder",
@@ -22,7 +22,7 @@
       "path": "models/staged/faces/w600k_mbf.onnx",
       "hash_sha256": "9cc6e4a75f0e2bf0b1aed94578f144d15175f357bdc05e815e5c4a02b319eb4f",
       "source": "https://github.com/deepinsight/insightface/releases/download/v0.7/buffalo_s.zip",
-      "license": "MIT (InsightFace ArcFace MobileFaceNet, w600k)"
+      "license": "InsightFace model zoo: weights non-commercial research ONLY (MBF@WebFace600K); code MIT — production/commercial use requires a license-cleared alternative"
     }
   ]
 }

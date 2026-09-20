@@ -115,7 +115,7 @@ operator-side staging path any production model takes.
 pip install -r requirements.txt
 pip install pytest pytest-cov httpx numpy
 rm -f test_localsight.db
-pytest -q                       # 74 tests: auth, RBAC, SSRF, encryption, analytics, pipeline, API, live, alerts, ONNX detector, review regressions
+pytest -q                       # 172 tests: auth, RBAC, SSRF, encryption, analytics, pipeline, API, live, alerts, forensic search, ONNX detector, review regressions
 ```
 
 Coverage report: `pytest --cov=packages --cov=apps --cov-fail-under=50` (currently 74%).
@@ -127,10 +127,10 @@ detection write-gating, and live-stream stop/reap.
 
 ## CI/CD
 
-Every push to `main` and every PR runs a 9-job GitHub Actions pipeline:
+Every push to `main` and every PR runs a 10-job GitHub Actions pipeline:
 
 - **lint** — ruff + mypy
-- **unit tests** — pytest against SQLite (74 tests, ~17s)
+- **unit tests** — pytest against SQLite (172 tests, ~60s)
 - **integration** — pytest against PostgreSQL + pgvector
 - **dependency audit** — pip-audit (OSV/PyPI) + Safety (pyup.io)
 - **CodeQL SAST** — GitHub code scanning for Python
@@ -308,7 +308,7 @@ infrastructure/  docker, compose, nginx, monitoring
 docs/             architecture, security, operations, integrations, api
 scripts/          gen_env.py, capacity.py
 ui/               static dashboard (served at /)
-tests/            unit + security + integration (74 tests)
+tests/            unit + security + integration (172 tests)
 ```
 
 ## Status

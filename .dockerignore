@@ -34,3 +34,8 @@ ui/node_modules/
 .idea/
 .vscode/
 *.log
+
+# BYOM: the image ships zero model weights — the operator mounts models/
+# read-only at runtime (compose does this). Prevents an operator's local
+# staging from leaking AGPL/research-restricted checkpoints into a layer.
+models/staged/
