@@ -72,3 +72,17 @@ class StorageProvider(ABC):
         signing cap window — over-long or non-numeric values are rejected.
         """
         ...
+    @property
+    def local_volume_path(self) -> str | None:
+        """Filesystem path backing media storage, or None when there is none.
+
+        Concrete (not abstract) on purpose: the safe default for any backend is
+        "no local volume", so an implementation that cannot answer inherits a
+        truthful `None` instead of failing to construct. The worker's
+        disk-pressure monitor samples this path — a provider that returns the
+        wrong path (or None for a local disk) silently disables the alarm that
+        protects recordings from a full volume, so overrides must return the
+        volume media actually lands on.
+        """
+        return None
+

@@ -24,6 +24,15 @@ class LocalFilesystemStorage(StorageProvider):
         os.makedirs(self._root, exist_ok=True)
         self._secret = signing_secret.encode()
 
+    @property
+    def local_volume_path(self) -> str | None:
+        """The recordings volume the worker's disk-pressure monitor samples.
+
+        Local storage *is* the media volume, so this is exactly the disk whose
+        exhaustion loses evidence (reliability plan F3).
+        """
+        return self._root
+
     # ── safety ────────────────────────────────────────────────────────────
     def _resolve(self, key: str) -> str:
         if not key or key.startswith("/") or ".." in key.split("/"):
