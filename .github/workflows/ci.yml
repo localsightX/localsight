@@ -2,7 +2,7 @@
 #
 # Quality gates:
 #   1. Lint + type-check
-#   2. Unit tests (172 tests) + browser UI e2e (45 tests, merge-blocking)
+#   2. Unit tests (187 tests) + browser UI e2e (45 tests, merge-blocking)
 #   3. Dependency security (pip-audit, Safety)
 #   4. SAST (CodeQL + Semgrep)
 #   5. Container vulnerability scan (Trivy)
