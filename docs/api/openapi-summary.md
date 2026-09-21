@@ -196,8 +196,12 @@ vocabulary, and numeric knobs are range-checked. An invalid payload returns
 `400` with `{"message", "schema_version", "errors": ["rules[0].zone: ..."]}`
 field-path errors. Every rule also accepts the engine knobs `cooldown_sec`
 (minimum seconds between fires, 0 = unlimited) and `min_size` (normalized
-bbox-area floor to ignore tiny/far detections). The audit trail records the
-grammar `schema_version` with each write.
+bbox-area floor to ignore tiny/far detections); zone rules additionally accept
+`id_switch_grace_sec` (R3.2: dwell state carries across a tracker ID switch
+inside the zone, so re-assigned tracks neither reset dwell nor double-fire).
+A zone hit means the detection centroid is inside the polygon OR at least 50%
+of the detection box is covered by it — the same coverage semantics as privacy
+masks. The audit trail records the grammar `schema_version` with each write.
 
 ### Use case: Configure a perimeter intrusion zone
 ```bash

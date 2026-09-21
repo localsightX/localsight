@@ -1,0 +1,25 @@
+{
+  "camera_id": "cam-replay",
+  "description": "Loitering (dwell 4 s, id_switch_grace 3 s): fires once at 4 s of presence; a tracker ID switch inside the zone inherits the dwell state and fired flag, so it does not double-fire.",
+  "rules": [
+    {"type": "loitering", "rule_id": "bench-1",
+     "zone": [[0.4, 0.4], [0.6, 0.4], [0.6, 0.6], [0.4, 0.6]],
+     "dwell_sec": 4, "id_switch_grace_sec": 3, "labels": ["person"]}
+  ],
+  "frames": [
+    {"t": 0, "tracks": [["t1", "person", [0.48, 0.48, 0.04, 0.08]]]},
+    {"t": 1, "tracks": [["t1", "person", [0.48, 0.48, 0.04, 0.08]]]},
+    {"t": 2, "tracks": [["t1", "person", [0.48, 0.48, 0.04, 0.08]]]},
+    {"t": 3, "tracks": [["t1", "person", [0.48, 0.48, 0.04, 0.08]]]},
+    {"t": 4, "tracks": [["t1", "person", [0.48, 0.48, 0.04, 0.08]]]},
+    {"t": 5, "tracks": []},
+    {"t": 6, "tracks": [["t2", "person", [0.48, 0.48, 0.04, 0.08]]]},
+    {"t": 7, "tracks": [["t2", "person", [0.48, 0.48, 0.04, 0.08]]]},
+    {"t": 8, "tracks": [["t2", "person", [0.48, 0.48, 0.04, 0.08]]]}
+  ],
+  "expect": [
+    {"rule_type": "loitering", "rule_id": "bench-1", "at_frame": 4},
+    {"rule_type": "loitering", "rule_id": "bench-1",
+     "not_at_frames": [0, 1, 2, 3, 5, 6, 7, 8]}
+  ]
+}
