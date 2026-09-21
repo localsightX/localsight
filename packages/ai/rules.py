@@ -34,6 +34,11 @@ EVENT_LOITERING = "loitering"
 EVENT_OBJECT_LEFT = "object_left"
 EVENT_OBJECT_REMOVED = "object_removed"
 EVENT_CROWD = "crowd"
+EVENT_STOPPED_VEHICLE = "stopped_vehicle"
+
+# R3.4: labels that can *own* an abandoned-object candidate
+_OWNER_LABELS = frozenset({"person", "vehicle", "truck", "bus", "motorcycle", "bicycle"})
+_ATTACH_MIN_OVERLAP = 0.1  # owner must cover this share of the candidate's area
 
 # Verdict tracing (R3.5 replay tester): dataclass name -> grammar type name
 _RULE_TYPE_NAMES = {
@@ -42,6 +47,7 @@ _RULE_TYPE_NAMES = {
     "LoiteringRule": "loitering",
     "ObjectLeftRule": "object_left",
     "CrowdCountRule": "crowd",
+    "StoppedVehicleRule": "stopped_vehicle",
 }
 _TRACE_MAX = 10000  # verdict-trace cap so a pathological dry-run cannot balloon
 _DIR_MIN_SAMPLES = 3  # R3.3: direction from a >=3-sample trajectory window
@@ -181,6 +187,23 @@ def _clip_polygon(poly: List[Pt], rect: Tuple[float, float, float, float]) -> Li
     return out
 
 
+def bboxes_attached(cand: tuple[float, float, float, float],
+                    other: tuple[float, float, float, float]) -> bool:
+    """True when ``other`` (an owner box: person/vehicle) is attached to ``cand``.
+
+    R3.4 abandonment test: the candidate's center lies inside the owner's box
+    (carried, stood over) or the owner covers at least ``_ATTACH_MIN_OVERLAP``
+    of the candidate's area (a hand on the handle, a car door). Both in
+    normalized [0,1] coordinates."""
+    cx, cy = cand[0] + cand[2] / 2, cand[1] + cand[3] / 2
+    if other[0] <= cx <= other[0] + other[2] and other[1] <= cy <= other[1] + other[3]:
+        return True
+    ix = max(0.0, min(cand[0] + cand[2], other[0] + other[2]) - max(cand[0], other[0]))
+    iy = max(0.0, min(cand[1] + cand[3], other[1] + other[3]) - max(cand[1], other[1]))
+    area = cand[2] * cand[3]
+    return area > 0 and (ix * iy) / area >= _ATTACH_MIN_OVERLAP
+
+
 def bbox_zone_overlap_fraction(
     bbox: Tuple[float, float, float, float], poly: List[Pt]
 ) -> float:
@@ -246,6 +269,7 @@ class ObjectLeftRule:
     cooldown_sec: float = 0.0  # grammar v1: min seconds between fires (0 = unlimited)
     min_size: float = 0.0      # grammar v1: minimum normalized bbox area (w*h)
     id_switch_grace_sec: float = 0.0  # R3.2: inherit dwell across tracker ID switches
+    require_unattended: bool = True   # R3.4: attached owner => not abandoned
     labels: Tuple[str, ...] = ("bag", "package", "person")
 
 
@@ -261,11 +285,26 @@ class CrowdCountRule:
 
 
 @dataclass
+class StoppedVehicleRule:
+    rule_id: str
+    zone: list[Pt]
+    camera_id: str = ""
+    stopped_sec: float = 30.0  # R3.4: dwell at ~0 speed before firing
+    max_speed: float = 0.02    # R3.4: normalized units/second that counts as stopped
+    cooldown_sec: float = 0.0  # grammar v1: min seconds between fires (0 = unlimited)
+    min_size: float = 0.0      # grammar v1: minimum normalized bbox area (w*h)
+    id_switch_grace_sec: float = 0.0  # R3.2: inherit dwell across tracker ID switches
+    labels: tuple[str, ...] = ("vehicle", "truck", "bus", "motorcycle", "bicycle")
+
+
+@dataclass
 class _TrackMem:
     last_center: Optional[Pt] = None
     history: deque = field(default_factory=lambda: deque(maxlen=_DIR_WINDOW))  # R3.3
+    ts_history: deque = field(default_factory=lambda: deque(maxlen=_DIR_WINDOW))  # R3.4 speed
     inside_zones: dict = field(default_factory=dict)  # rule_id -> first entered ts
     loiter_zones: dict = field(default_factory=dict)  # rule_id -> first entered ts
+    stopped_zones: dict = field(default_factory=dict)  # R3.4 rule_id -> stopped since ts
     crossed_lines: set = field(default_factory=set)  # rule_ids already fired (hysteresis)
     bbox: Tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)
     label: str = "person"
@@ -351,6 +390,30 @@ class RuleEngine:
             return True
         return bbox_zone_overlap_fraction(bbox, poly) >= _ZONE_MIN_OVERLAP
 
+    def _trajectory_speed(self, m: _TrackMem) -> float:
+        """Mean speed over the trajectory window (normalized units / second).
+
+        R3.4: uses the same bounded window as R3.3's direction, so one jittery
+        detection cannot make a parked car look like it is moving. Returns 0.0
+        when the window is too short to measure — a fresh track has no evidence
+        of movement yet, so a stopped-vehicle timer may start."""
+        if len(m.history) < 2 or len(m.ts_history) < 2:
+            return 0.0
+        (x0, y0), (x1, y1) = m.history[0], m.history[-1]
+        span = (m.ts_history[-1] - m.ts_history[0]).total_seconds()
+        if span <= 0:
+            return 0.0
+        return (((x1 - x0) ** 2 + (y1 - y0) ** 2) ** 0.5) / span
+
+    def _has_attached_owner(self, cand, track_id: str, tracks) -> bool:
+        """R3.4: is any person/vehicle track attached to this candidate box?"""
+        for tid, label, bbox in tracks:
+            if tid == track_id or label not in _OWNER_LABELS:
+                continue
+            if bboxes_attached(cand, bbox):
+                return True
+        return False
+
     def _inherit_departed(self, track_id: str, bbox, ts: dt.datetime) -> _TrackMem | None:
         """ID-switch grace (R3.2): a new track id appearing near where a
         recently-departed track vanished inherits its zone dwell state (entry
@@ -419,6 +482,7 @@ class RuleEngine:
             prev = m.last_center
             m.last_center = center
             m.history.append(center)
+            m.ts_history.append(ts)
 
             for rule in self.rules:
                 if not self._matches(getattr(rule, "labels", ()), label):
@@ -435,7 +499,10 @@ class RuleEngine:
                 elif rtype == "LoiteringRule":
                     out.extend(self._eval_loiter(rule, track_id, label, bbox, center, ts, m))
                 elif rtype == "ObjectLeftRule":
-                    out.extend(self._eval_object_left(rule, track_id, label, bbox, center, ts, m))
+                    out.extend(self._eval_object_left(rule, track_id, label, bbox, center, ts, m,
+                                                      tracks))
+                elif rtype == "StoppedVehicleRule":
+                    out.extend(self._eval_stopped(rule, track_id, label, bbox, center, ts, m))
                 elif rtype == "CrowdCountRule":
                     pass  # handled in a global pass below
         out.extend(self._eval_crowd(tracks, ts))
@@ -443,7 +510,8 @@ class RuleEngine:
         for tid in list(self._mem):
             if tid not in seen:
                 mem = self._mem.pop(tid)
-                if grace > 0 and (mem.inside_zones or mem.loiter_zones):
+                if grace > 0 and (mem.inside_zones or mem.loiter_zones
+                                  or mem.stopped_zones):
                     self._departed[tid] = (ts, mem)  # ID-switch grace tombstone
         self._prune_departed(ts, grace)
         return out
@@ -530,9 +598,18 @@ class RuleEngine:
             m.loiter_zones.pop("_fired_" + rid, None)
             return []
 
-    def _eval_object_left(self, rule, track_id, label, bbox, center, ts, m):
+    def _eval_object_left(self, rule, track_id, label, bbox, center, ts, m, tracks=()):
         rid = rule.rule_id
         inside = self._zone_hit(rule.zone, bbox)
+        attended = (getattr(rule, "require_unattended", True)
+                    and self._has_attached_owner(bbox, track_id, tracks))
+        if inside and attended:
+            # R3.4: a bag/package with its owner attached is not abandoned —
+            # clear any pending dwell so the clock restarts if they walk off.
+            self._trace_append(ts, "attended_owner", rule, track_id)
+            m.loiter_zones.pop(rid, None)
+            m.loiter_zones.pop("_left_fired_" + rid, None)
+            return []
         if inside:
             if rid not in m.loiter_zones:
                 m.loiter_zones[rid] = ts
@@ -561,6 +638,45 @@ class RuleEngine:
             m.loiter_zones.pop(rid, None)
             m.loiter_zones.pop("_left_fired_" + rid, None)
         return []
+
+    def _eval_stopped(self, rule, track_id, label, bbox, center, ts, m):
+        """R3.4 stopped vehicle: ~0 speed for >= stopped_sec inside a no-stopping
+        zone. Movement (or leaving the zone) re-arms both the timer and the
+        fire, so a vehicle that stops again can alert again (cooldown applies)."""
+        rid = rule.rule_id
+        inside = self._zone_hit(rule.zone, bbox)
+        if not inside:
+            self._trace_append(ts, "no_zone_hit", rule, track_id)
+            m.stopped_zones.pop(rid, None)
+            m.stopped_zones.pop("_fired_" + rid, None)
+            return []
+        speed = self._trajectory_speed(m)
+        if speed > rule.max_speed:
+            self._trace_append(ts, "moving", rule, track_id, speed=round(speed, 4))
+            m.stopped_zones.pop(rid, None)
+            m.stopped_zones.pop("_fired_" + rid, None)
+            return []
+        if rid not in m.stopped_zones:
+            m.stopped_zones[rid] = ts
+        dwell = (ts - m.stopped_zones[rid]).total_seconds()
+        if dwell < rule.stopped_sec:
+            self._trace_append(ts, "stopped_warming", rule, track_id,
+                               dwell=round(dwell, 2), need=rule.stopped_sec)
+            return []
+        if m.stopped_zones.get("_fired_" + rid) is True:
+            self._trace_append(ts, "already_fired", rule, track_id)
+            return []
+        key = (rid, track_id)
+        if not self._cooldown_ok(key, ts, getattr(rule, "cooldown_sec", 0.0)):
+            self._trace_append(ts, "cooldown_blocked", rule, track_id)
+            return []
+        m.stopped_zones["_fired_" + rid] = True
+        self._mark_fire(key, ts)
+        self._trace_append(ts, "fired", rule, track_id, dwell=round(dwell, 2),
+                           speed=round(speed, 4))
+        return [AnalyticEvent(rid, EVENT_STOPPED_VEHICLE, self.camera_id, track_id, label, bbox,
+                              ts, detail={"stopped_sec": round(dwell, 2),
+                                          "speed": round(speed, 4)})]
 
     def _eval_crowd(self, tracks, ts):
         out: List[AnalyticEvent] = []
@@ -632,11 +748,20 @@ def rule_from_dict(camera_id: str, spec: dict):
         return ObjectLeftRule(rid, zone, camera_id, stationary_sec=spec.get("stationary_sec", 30.0),
                               labels=labels or ("bag", "package"),
                               cooldown_sec=cooldown, min_size=min_size,
-                              id_switch_grace_sec=spec.get("id_switch_grace_sec", 0.0))
+                              id_switch_grace_sec=spec.get("id_switch_grace_sec", 0.0),
+                              require_unattended=spec.get("require_unattended", True))
     if rtype == "crowd":
         return CrowdCountRule(rid, [tuple(p) for p in spec["zone"]], camera_id,
                               threshold=spec.get("threshold", 10), labels=labels or ("person",),
                               cooldown_sec=cooldown, min_size=min_size)
+    if rtype == "stopped_vehicle":
+        return StoppedVehicleRule(rid, [tuple(p) for p in spec["zone"]], camera_id,
+                                  stopped_sec=spec.get("stopped_sec", 30.0),
+                                  max_speed=spec.get("max_speed", 0.02),
+                                  cooldown_sec=cooldown, min_size=min_size,
+                                  id_switch_grace_sec=spec.get("id_switch_grace_sec", 0.0),
+                                  labels=labels or ("vehicle", "truck", "bus",
+                                                    "motorcycle", "bicycle"))
     raise ValueError(f"unknown rule type: {rtype}")
 
 

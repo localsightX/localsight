@@ -1,0 +1,30 @@
+{
+  "camera_id": "cam-replay",
+  "description": "R3.4: an owner carries a bag in (frames 0-1), walks away (frame 2+); the bag is then stationary AND unattended for stationary_sec 3, so object_left fires exactly once at frame 5 — never while the owner was attached.",
+  "rules": [
+    {"type": "object_left", "rule_id": "abandon-2",
+     "zone": [[0.4, 0.4], [0.6, 0.4], [0.6, 0.6], [0.4, 0.6]],
+     "stationary_sec": 3, "labels": ["bag", "package"]}
+  ],
+  "frames": [
+    {"t": 0, "tracks": [["bag1", "bag", [0.48, 0.48, 0.05, 0.05]],
+                        ["p1", "person", [0.44, 0.30, 0.14, 0.30]]]},
+    {"t": 1, "tracks": [["bag1", "bag", [0.48, 0.48, 0.05, 0.05]],
+                        ["p1", "person", [0.44, 0.30, 0.14, 0.30]]]},
+    {"t": 2, "tracks": [["bag1", "bag", [0.48, 0.48, 0.05, 0.05]],
+                        ["p1", "person", [0.10, 0.10, 0.08, 0.16]]]},
+    {"t": 3, "tracks": [["bag1", "bag", [0.48, 0.48, 0.05, 0.05]],
+                        ["p1", "person", [0.10, 0.10, 0.08, 0.16]]]},
+    {"t": 4, "tracks": [["bag1", "bag", [0.48, 0.48, 0.05, 0.05]],
+                        ["p1", "person", [0.10, 0.10, 0.08, 0.16]]]},
+    {"t": 5, "tracks": [["bag1", "bag", [0.48, 0.48, 0.05, 0.05]],
+                        ["p1", "person", [0.10, 0.10, 0.08, 0.16]]]},
+    {"t": 6, "tracks": [["bag1", "bag", [0.48, 0.48, 0.05, 0.05]],
+                        ["p1", "person", [0.10, 0.10, 0.08, 0.16]]]}
+  ],
+  "expect": [
+    {"rule_type": "object_left", "rule_id": "abandon-2", "at_frame": 5},
+    {"rule_type": "object_left", "rule_id": "abandon-2",
+     "not_at_frames": [0, 1, 2, 3, 4, 6]}
+  ]
+}

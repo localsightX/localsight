@@ -1,0 +1,28 @@
+{
+  "camera_id": "cam-replay",
+  "description": "R3.4: a bag stays with its owner (the person box contains the bag) for the whole window against stationary_sec 3 — an attended object is NOT abandoned, so object_left never fires.",
+  "rules": [
+    {"type": "object_left", "rule_id": "abandon-1",
+     "zone": [[0.4, 0.4], [0.6, 0.4], [0.6, 0.6], [0.4, 0.6]],
+     "stationary_sec": 3, "labels": ["bag", "package"]}
+  ],
+  "frames": [
+    {"t": 0, "tracks": [["bag1", "bag", [0.48, 0.48, 0.05, 0.05]],
+                        ["p1", "person", [0.44, 0.30, 0.14, 0.30]]]},
+    {"t": 1, "tracks": [["bag1", "bag", [0.48, 0.48, 0.05, 0.05]],
+                        ["p1", "person", [0.44, 0.30, 0.14, 0.30]]]},
+    {"t": 2, "tracks": [["bag1", "bag", [0.48, 0.48, 0.05, 0.05]],
+                        ["p1", "person", [0.44, 0.30, 0.14, 0.30]]]},
+    {"t": 3, "tracks": [["bag1", "bag", [0.48, 0.48, 0.05, 0.05]],
+                        ["p1", "person", [0.44, 0.30, 0.14, 0.30]]]},
+    {"t": 4, "tracks": [["bag1", "bag", [0.48, 0.48, 0.05, 0.05]],
+                        ["p1", "person", [0.44, 0.30, 0.14, 0.30]]]},
+    {"t": 5, "tracks": [["bag1", "bag", [0.48, 0.48, 0.05, 0.05]],
+                        ["p1", "person", [0.44, 0.30, 0.14, 0.30]]]},
+    {"t": 6, "tracks": [["bag1", "bag", [0.48, 0.48, 0.05, 0.05]],
+                        ["p1", "person", [0.44, 0.30, 0.14, 0.30]]]}
+  ],
+  "expect": [
+    {"rule_type": "object_left", "rule_id": "abandon-1", "never_fires": true}
+  ]
+}
