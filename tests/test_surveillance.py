@@ -589,6 +589,25 @@ def test_rules_api(client):
     assert client.get(f"/api/cameras/{cam_id}/rules", headers=vh).status_code == 403
 
 
+def test_rules_api_grammar_v1_field_paths(client):
+    """Grammar v1 gate: 400 carries field-path errors + schema_version."""
+    h = {"Authorization": _admin(client)}
+    r = client.post("/api/cameras", json={"name": "cam-g"}, headers=h)
+    cam_id = r.json()["id"]
+    zone = [[0.4, 0.4], [0.6, 0.4], [0.6, 0.6], [0.4, 0.6]]
+    bad = {"rules": [{"type": "intrusion", "rule_id": "v", "zone": [[0, 0], [1, 1]], "min_size": 9}]}
+    resp = client.put(f"/api/cameras/{cam_id}/rules", json=bad, headers=h)
+    assert resp.status_code == 400
+    detail = resp.json()["detail"]
+    assert detail["schema_version"] == 1
+    paths = " | ".join(detail["errors"])
+    assert "rules[0].zone" in paths and "rules[0].min_size" in paths
+    # a valid payload using the new knobs round-trips through GET unchanged
+    good = {"rules": [{"type": "intrusion", "rule_id": "v", "zone": zone, "cooldown_sec": 5}]}
+    assert client.put(f"/api/cameras/{cam_id}/rules", json=good, headers=h).status_code == 200
+    assert client.get(f"/api/cameras/{cam_id}/rules", headers=h).json()["rules"] == good["rules"]
+
+
 # ── alerts API ──────────────────────────────────────────────────────────────
 def test_alerts_api(client):
     h = {"Authorization": _admin(client)}

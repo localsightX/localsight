@@ -107,6 +107,8 @@ class LineCrossingRule:
     b: Pt
     camera_id: str = ""
     direction: Optional[int] = None  # None=any, 1 or -1 = require that sign
+    cooldown_sec: float = 0.0  # grammar v1: min seconds between fires (0 = unlimited)
+    min_size: float = 0.0      # grammar v1: minimum normalized bbox area (w*h)
     labels: Tuple[str, ...] = ("person", "vehicle")
 
 
@@ -116,6 +118,8 @@ class ZoneIntrusionRule:
     zone: List[Pt]
     camera_id: str = ""
     min_dwell_sec: float = 0.0
+    cooldown_sec: float = 0.0  # grammar v1: min seconds between fires (0 = unlimited)
+    min_size: float = 0.0      # grammar v1: minimum normalized bbox area (w*h)
     labels: Tuple[str, ...] = ("person", "vehicle")
 
 
@@ -125,6 +129,8 @@ class LoiteringRule:
     zone: List[Pt]
     camera_id: str = ""
     dwell_sec: float = 30.0
+    cooldown_sec: float = 0.0  # grammar v1: min seconds between fires (0 = unlimited)
+    min_size: float = 0.0      # grammar v1: minimum normalized bbox area (w*h)
     labels: Tuple[str, ...] = ("person",)
 
 
@@ -134,6 +140,8 @@ class ObjectLeftRule:
     zone: List[Pt]
     camera_id: str = ""
     stationary_sec: float = 30.0
+    cooldown_sec: float = 0.0  # grammar v1: min seconds between fires (0 = unlimited)
+    min_size: float = 0.0      # grammar v1: minimum normalized bbox area (w*h)
     labels: Tuple[str, ...] = ("bag", "package", "person")
 
 
@@ -143,6 +151,8 @@ class CrowdCountRule:
     zone: List[Pt]
     camera_id: str = ""
     threshold: int = 10
+    cooldown_sec: float = 0.0  # grammar v1: min seconds between fires (0 = unlimited)
+    min_size: float = 0.0      # grammar v1: minimum normalized bbox area (w*h)
     labels: Tuple[str, ...] = ("person",)
 
 
@@ -164,6 +174,7 @@ class RuleEngine:
         self.rules: List = []
         self._mem: dict[str, _TrackMem] = {}
         self._crowd_fired: dict = {}
+        self._last_fire: dict[tuple[str, str] | str, dt.datetime] = {}  # grammar v1 cooldown
 
     def add(self, rule) -> None:
         if not getattr(rule, "camera_id", ""):
@@ -181,6 +192,20 @@ class RuleEngine:
 
     def _matches(self, rule_labels, label: str) -> bool:
         return not rule_labels or label in rule_labels
+
+    def _cooldown_ok(self, key: str, ts: dt.datetime, cooldown_sec: float) -> bool:
+        """Grammar v1 cooldown gate: True if ``key`` may fire at ``ts``.
+
+        ``cooldown_sec <= 0`` (the default) never throttles; otherwise a key
+        may fire again only once ``cooldown_sec`` have elapsed since its last
+        fire. Callers that pass the gate must record it via ``_mark_fire``."""
+        if cooldown_sec <= 0:
+            return True
+        last = self._last_fire.get(key)
+        return last is None or (ts - last).total_seconds() >= cooldown_sec
+
+    def _mark_fire(self, key: str, ts: dt.datetime) -> None:
+        self._last_fire[key] = ts
 
     def evaluate(
         self,
@@ -204,6 +229,8 @@ class RuleEngine:
             for rule in self.rules:
                 if not self._matches(getattr(rule, "labels", ()), label):
                     continue
+                if getattr(rule, "min_size", 0.0) and bbox[2] * bbox[3] < rule.min_size:
+                    continue  # grammar v1 min_size: ignore tracks below the area floor
                 rtype = type(rule).__name__
                 if rtype == "LineCrossingRule":
                     out.extend(self._eval_line(rule, track_id, label, bbox, prev, center, ts, m))
@@ -246,11 +273,15 @@ class RuleEngine:
             dwell = (ts - m.inside_zones[rid]).total_seconds()
             if rule.min_dwell_sec and dwell < rule.min_dwell_sec:
                 return []
+            key = (rid, track_id)
+            if not self._cooldown_ok(key, ts, getattr(rule, "cooldown_sec", 0.0)):
+                return []  # cooldown active: _fired_ left unset so a later visit can fire
             if m.inside_zones.get("_fired_" + rid) is True:
                 return []
             m.inside_zones["_fired_" + rid] = True
-            return [AnalyticEvent(rid, EVENT_INTRUSION, self.camera_id, track_id, label, bbox, ts,
-                                  detail={"dwell_sec": round(dwell, 2)})]
+            self._mark_fire(key, ts)
+            return [AnalyticEvent(rid, EVENT_INTRUSION, self.camera_id, track_id, label,
+                                  bbox, ts, detail={"dwell_sec": round(dwell, 2)})]
         else:
             m.inside_zones.pop(rid, None)
             m.inside_zones.pop("_fired_" + rid, None)
@@ -264,9 +295,13 @@ class RuleEngine:
                 m.loiter_zones[rid] = ts
             dwell = (ts - m.loiter_zones[rid]).total_seconds()
             if dwell >= rule.dwell_sec and m.loiter_zones.get("_fired_" + rid) is not True:
+                key = (rid, track_id)
+                if not self._cooldown_ok(key, ts, getattr(rule, "cooldown_sec", 0.0)):
+                    return []  # cooldown active: _fired_ left unset so a later visit can fire
                 m.loiter_zones["_fired_" + rid] = True
-                return [AnalyticEvent(rid, EVENT_LOITERING, self.camera_id, track_id, label, bbox, ts,
-                                      detail={"dwell_sec": round(dwell, 2)})]
+                self._mark_fire(key, ts)
+                return [AnalyticEvent(rid, EVENT_LOITERING, self.camera_id, track_id, label,
+                                      bbox, ts, detail={"dwell_sec": round(dwell, 2)})]
             return []
         else:
             m.loiter_zones.pop(rid, None)
@@ -281,13 +316,18 @@ class RuleEngine:
                 m.loiter_zones[rid] = ts
             dwell = (ts - m.loiter_zones[rid]).total_seconds()
             if dwell >= rule.stationary_sec and m.loiter_zones.get("_left_fired_" + rid) is not True:
+                key = (rid, track_id)
+                if not self._cooldown_ok(key, ts, getattr(rule, "cooldown_sec", 0.0)):
+                    return []  # cooldown active: _left_fired_ left unset so a later visit can fire
                 m.loiter_zones["_left_fired_" + rid] = True
-                return [AnalyticEvent(rid, EVENT_OBJECT_LEFT, self.camera_id, track_id, label, bbox, ts,
-                                      detail={"stationary_sec": round(dwell, 2)})]
+                self._mark_fire(key, ts)
+                return [AnalyticEvent(rid, EVENT_OBJECT_LEFT, self.camera_id, track_id, label,
+                                      bbox, ts, detail={"stationary_sec": round(dwell, 2)})]
         else:
             if m.loiter_zones.get("_left_fired_" + rid) is True and label != "person":
                 m.loiter_zones.pop("_left_fired_" + rid, None)
-                return [AnalyticEvent(rid, EVENT_OBJECT_REMOVED, self.camera_id, track_id, label, bbox, ts)]
+                return [AnalyticEvent(rid, EVENT_OBJECT_REMOVED, self.camera_id,
+                                      track_id, label, bbox, ts)]
             m.loiter_zones.pop(rid, None)
             m.loiter_zones.pop("_left_fired_" + rid, None)
         return []
@@ -301,14 +341,19 @@ class RuleEngine:
             for track_id, label, bbox in tracks:
                 if not self._matches(rule.labels, label):
                     continue
+                if getattr(rule, "min_size", 0.0) and bbox[2] * bbox[3] < rule.min_size:
+                    continue  # grammar v1 min_size: ignore tracks below the area floor
                 if point_in_polygon(self._center(bbox), rule.zone):
                     count += 1
             fired = self._crowd_fired.get(rule.rule_id, False)
-            if count >= rule.threshold and not fired:
+            if (count >= rule.threshold and not fired
+                    and self._cooldown_ok(rule.rule_id, ts, getattr(rule, "cooldown_sec", 0.0))):
                 self._crowd_fired[rule.rule_id] = True
+                self._mark_fire(rule.rule_id, ts)
                 rep = max((t for t in tracks if self._matches(rule.labels, t[1])),
                           key=lambda t: t[2][2] * t[2][3])[2] if tracks else (0, 0, 0, 0)
-                out.append(AnalyticEvent(rule.rule_id, EVENT_CROWD, self.camera_id, "", "person", rep, ts,
+                out.append(AnalyticEvent(rule.rule_id, EVENT_CROWD, self.camera_id, "",
+                                         "person", rep, ts,
                                          score=float(count), detail={"count": count}))
             elif count < rule.threshold:
                 self._crowd_fired[rule.rule_id] = False
@@ -319,27 +364,37 @@ def rule_from_dict(camera_id: str, spec: dict):
     """Build a single rule from a JSON spec (UI/stored on Camera.rules).
 
     spec keys: type, rule_id, plus geometry (a/b points, or zone polygon),
-    optional direction/dwell_sec/threshold/labels.
+    optional direction/dwell_sec/threshold/labels and the grammar v1 knobs
+    cooldown_sec/min_size (see packages.ai.rulegrammar).
     """
     rtype = spec.get("type")
     rid = spec.get("rule_id") or f"{rtype}-{camera_id}"
     labels = tuple(spec.get("labels", ())) or ()
+    cooldown = spec.get("cooldown_sec", 0.0)
+    min_size = spec.get("min_size", 0.0)
     if rtype == "line_cross":
         return LineCrossingRule(rid, tuple(spec["a"]), tuple(spec["b"]), camera_id,
-                                direction=spec.get("direction"), labels=labels or ("person", "vehicle"))
+                                direction=spec.get("direction"),
+                                labels=labels or ("person", "vehicle"),
+                                cooldown_sec=cooldown, min_size=min_size)
     if rtype in ("intrusion", "loitering", "object_left"):
         zone = [tuple(p) for p in spec["zone"]]
         if rtype == "intrusion":
-            return ZoneIntrusionRule(rid, zone, camera_id, min_dwell_sec=spec.get("min_dwell_sec", 0.0),
-                                     labels=labels or ("person", "vehicle"))
+            return ZoneIntrusionRule(rid, zone, camera_id,
+                                     min_dwell_sec=spec.get("min_dwell_sec", 0.0),
+                                     labels=labels or ("person", "vehicle"),
+                                     cooldown_sec=cooldown, min_size=min_size)
         if rtype == "loitering":
             return LoiteringRule(rid, zone, camera_id, dwell_sec=spec.get("dwell_sec", 30.0),
-                                 labels=labels or ("person",))
+                                 labels=labels or ("person",),
+                                 cooldown_sec=cooldown, min_size=min_size)
         return ObjectLeftRule(rid, zone, camera_id, stationary_sec=spec.get("stationary_sec", 30.0),
-                              labels=labels or ("bag", "package"))
+                              labels=labels or ("bag", "package"),
+                              cooldown_sec=cooldown, min_size=min_size)
     if rtype == "crowd":
-        return CrowdCountRule(rid, [tuple(p) for p in spec["zone"]], camera_id, threshold=spec.get("threshold", 10),
-                              labels=labels or ("person",))
+        return CrowdCountRule(rid, [tuple(p) for p in spec["zone"]], camera_id,
+                              threshold=spec.get("threshold", 10), labels=labels or ("person",),
+                              cooldown_sec=cooldown, min_size=min_size)
     raise ValueError(f"unknown rule type: {rtype}")
 
 
