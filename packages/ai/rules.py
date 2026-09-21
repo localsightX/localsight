@@ -33,6 +33,16 @@ EVENT_OBJECT_LEFT = "object_left"
 EVENT_OBJECT_REMOVED = "object_removed"
 EVENT_CROWD = "crowd"
 
+# Verdict tracing (R3.5 replay tester): dataclass name -> grammar type name
+_RULE_TYPE_NAMES = {
+    "LineCrossingRule": "line_cross",
+    "ZoneIntrusionRule": "intrusion",
+    "LoiteringRule": "loitering",
+    "ObjectLeftRule": "object_left",
+    "CrowdCountRule": "crowd",
+}
+_TRACE_MAX = 10000  # verdict-trace cap so a pathological dry-run cannot balloon
+
 
 @dataclass
 class AnalyticEvent:
@@ -246,6 +256,7 @@ class RuleEngine:
         self._crowd_fired: dict = {}
         self._last_fire: dict[tuple[str, str] | str, dt.datetime] = {}  # grammar v1 cooldown
         self._departed: dict[str, tuple[dt.datetime, _TrackMem]] = {}  # R3.2 grace
+        self._trace: list[dict] | None = None  # R3.5 verdict tracing (per evaluate call)
 
     def add(self, rule) -> None:
         if not getattr(rule, "camera_id", ""):
@@ -283,6 +294,22 @@ class RuleEngine:
 
     def _mark_fire(self, key: str, ts: dt.datetime) -> None:
         self._last_fire[key] = ts
+
+    def _trace_append(self, ts: dt.datetime, decision: str, rule, track_id: str = "",
+                      **detail) -> None:
+        """Append a verdict-trace record (R3.5 replay tester).
+
+        No-op unless ``evaluate()`` was handed a trace list — the worker path
+        never does, so production pays only one ``is None`` check. Capped at
+        ``_TRACE_MAX`` so a pathological dry-run cannot balloon memory."""
+        if self._trace is None or len(self._trace) >= _TRACE_MAX:
+            return
+        self._trace.append({
+            "t": ts, "decision": decision,
+            "rule_id": getattr(rule, "rule_id", ""),
+            "rule_type": _RULE_TYPE_NAMES.get(type(rule).__name__, "unknown"),
+            "track_id": track_id, **detail,
+        })
 
     def _grace_max(self) -> float:
         """Largest configured ID-switch grace across rules (0 disables the
@@ -346,10 +373,15 @@ class RuleEngine:
         self,
         tracks: List[Tuple[str, str, Tuple[float, float, float, float]]],
         ts: dt.datetime,
+        trace: list[dict] | None = None,
     ) -> List[AnalyticEvent]:
         """tracks: list of (track_id, label, bbox). Returns fired AnalyticEvents.
 
-        A track absent from this frame is forgotten (its memory is cleared)."""
+        A track absent from this frame is forgotten (its memory is cleared).
+        ``trace`` (R3.5): when given, a verdict record is appended for every
+        evaluated decision (fired / blocked / warming / ...) so the replay
+        tester can explain itself. The worker leaves it None."""
+        self._trace = trace
         out: List[AnalyticEvent] = []
         seen = set()
         for track_id, label, bbox in tracks:
@@ -365,6 +397,8 @@ class RuleEngine:
                 if not self._matches(getattr(rule, "labels", ()), label):
                     continue
                 if getattr(rule, "min_size", 0.0) and bbox[2] * bbox[3] < rule.min_size:
+                    self._trace_append(ts, "min_size_skipped", rule, track_id,
+                                       area=round(bbox[2] * bbox[3], 4), need=rule.min_size)
                     continue  # grammar v1 min_size: ignore tracks below the area floor
                 rtype = type(rule).__name__
                 if rtype == "LineCrossingRule":
@@ -392,14 +426,18 @@ class RuleEngine:
         if prev is None:
             return []
         if not segments_intersect(prev, cur, rule.a, rule.b):
+            self._trace_append(ts, "no_cross", rule, track_id)
             return []
         direction = crossing_direction(prev, cur, rule.a, rule.b)
         if rule.direction is not None and direction != rule.direction:
+            self._trace_append(ts, "direction_mismatch", rule, track_id, got=direction)
             return []
         rid = rule.rule_id
         if rid in m.crossed_lines:
+            self._trace_append(ts, "already_fired", rule, track_id)
             return []  # hysteresis: one event per entry
         m.crossed_lines.add(rid)
+        self._trace_append(ts, "fired", rule, track_id, direction=direction)
         return [AnalyticEvent(rid, EVENT_LINE_CROSS, self.camera_id, track_id, label, bbox, ts,
                                detail={"direction": direction})]
 
@@ -411,17 +449,23 @@ class RuleEngine:
                 m.inside_zones[rid] = ts
             dwell = (ts - m.inside_zones[rid]).total_seconds()
             if rule.min_dwell_sec and dwell < rule.min_dwell_sec:
+                self._trace_append(ts, "min_dwell_warming", rule, track_id,
+                                   dwell=round(dwell, 2), need=rule.min_dwell_sec)
                 return []
             key = (rid, track_id)
             if not self._cooldown_ok(key, ts, getattr(rule, "cooldown_sec", 0.0)):
+                self._trace_append(ts, "cooldown_blocked", rule, track_id)
                 return []  # cooldown active: _fired_ left unset so a later visit can fire
             if m.inside_zones.get("_fired_" + rid) is True:
+                self._trace_append(ts, "already_fired", rule, track_id)
                 return []
             m.inside_zones["_fired_" + rid] = True
             self._mark_fire(key, ts)
+            self._trace_append(ts, "fired", rule, track_id, dwell=round(dwell, 2))
             return [AnalyticEvent(rid, EVENT_INTRUSION, self.camera_id, track_id, label,
                                   bbox, ts, detail={"dwell_sec": round(dwell, 2)})]
         else:
+            self._trace_append(ts, "no_zone_hit", rule, track_id)
             m.inside_zones.pop(rid, None)
             m.inside_zones.pop("_fired_" + rid, None)
             return []
@@ -436,13 +480,19 @@ class RuleEngine:
             if dwell >= rule.dwell_sec and m.loiter_zones.get("_fired_" + rid) is not True:
                 key = (rid, track_id)
                 if not self._cooldown_ok(key, ts, getattr(rule, "cooldown_sec", 0.0)):
+                    self._trace_append(ts, "cooldown_blocked", rule, track_id)
                     return []  # cooldown active: _fired_ left unset so a later visit can fire
                 m.loiter_zones["_fired_" + rid] = True
                 self._mark_fire(key, ts)
+                self._trace_append(ts, "fired", rule, track_id, dwell=round(dwell, 2))
                 return [AnalyticEvent(rid, EVENT_LOITERING, self.camera_id, track_id, label,
                                       bbox, ts, detail={"dwell_sec": round(dwell, 2)})]
+            self._trace_append(ts, "dwell_warming" if dwell < rule.dwell_sec
+                               else "already_fired", rule, track_id,
+                               dwell=round(dwell, 2), need=rule.dwell_sec)
             return []
         else:
+            self._trace_append(ts, "no_zone_hit", rule, track_id)
             m.loiter_zones.pop(rid, None)
             m.loiter_zones.pop("_fired_" + rid, None)
             return []
@@ -458,14 +508,21 @@ class RuleEngine:
                     and m.loiter_zones.get("_left_fired_" + rid) is not True):
                 key = (rid, track_id)
                 if not self._cooldown_ok(key, ts, getattr(rule, "cooldown_sec", 0.0)):
+                    self._trace_append(ts, "cooldown_blocked", rule, track_id)
                     return []  # cooldown active: _left_fired_ left unset so a later visit can fire
                 m.loiter_zones["_left_fired_" + rid] = True
                 self._mark_fire(key, ts)
+                self._trace_append(ts, "fired", rule, track_id, dwell=round(dwell, 2))
                 return [AnalyticEvent(rid, EVENT_OBJECT_LEFT, self.camera_id, track_id, label,
                                       bbox, ts, detail={"stationary_sec": round(dwell, 2)})]
+            self._trace_append(ts, "stationary_warming" if dwell < rule.stationary_sec
+                               else "already_fired", rule, track_id,
+                               dwell=round(dwell, 2), need=rule.stationary_sec)
         else:
+            self._trace_append(ts, "no_zone_hit", rule, track_id)
             if m.loiter_zones.get("_left_fired_" + rid) is True and label != "person":
                 m.loiter_zones.pop("_left_fired_" + rid, None)
+                self._trace_append(ts, "fired_removed", rule, track_id)
                 return [AnalyticEvent(rid, EVENT_OBJECT_REMOVED, self.camera_id,
                                       track_id, label, bbox, ts)]
             m.loiter_zones.pop(rid, None)
@@ -482,14 +539,22 @@ class RuleEngine:
                 if not self._matches(rule.labels, label):
                     continue
                 if getattr(rule, "min_size", 0.0) and bbox[2] * bbox[3] < rule.min_size:
+                    self._trace_append(ts, "min_size_skipped", rule, track_id,
+                                       area=round(bbox[2] * bbox[3], 4), need=rule.min_size)
                     continue  # grammar v1 min_size: ignore tracks below the area floor
                 if self._zone_hit(rule.zone, bbox):
                     count += 1
             fired = self._crowd_fired.get(rule.rule_id, False)
+            if count >= rule.threshold and self._trace is not None:
+                if fired:
+                    self._trace_append(ts, "already_fired", rule, "", count=count)
+                elif not self._cooldown_ok(rule.rule_id, ts, getattr(rule, "cooldown_sec", 0.0)):
+                    self._trace_append(ts, "cooldown_blocked", rule, "", count=count)
             if (count >= rule.threshold and not fired
                     and self._cooldown_ok(rule.rule_id, ts, getattr(rule, "cooldown_sec", 0.0))):
                 self._crowd_fired[rule.rule_id] = True
                 self._mark_fire(rule.rule_id, ts)
+                self._trace_append(ts, "fired", rule, "", count=count)
                 rep = max((t for t in tracks if self._matches(rule.labels, t[1])),
                           key=lambda t: t[2][2] * t[2][3])[2] if tracks else (0, 0, 0, 0)
                 out.append(AnalyticEvent(rule.rule_id, EVENT_CROWD, self.camera_id, "",
@@ -497,6 +562,7 @@ class RuleEngine:
                                          score=float(count), detail={"count": count}))
             elif count < rule.threshold:
                 self._crowd_fired[rule.rule_id] = False
+                self._trace_append(ts, "count_below", rule, "", count=count, need=rule.threshold)
         return out
 
 

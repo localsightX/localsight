@@ -1,0 +1,18 @@
+{
+  "camera_id": "cam-replay",
+  "description": "Negative: a person walks through the zone in 3 s against dwell_sec 6 — no loitering alert.",
+  "rules": [
+    {"type": "loitering", "rule_id": "bench-2",
+     "zone": [[0.4, 0.4], [0.6, 0.4], [0.6, 0.6], [0.4, 0.6]],
+     "dwell_sec": 6, "labels": ["person"]}
+  ],
+  "frames": [
+    {"t": 0, "tracks": [["t1", "person", [0.42, 0.48, 0.04, 0.08]]]},
+    {"t": 1, "tracks": [["t1", "person", [0.48, 0.48, 0.04, 0.08]]]},
+    {"t": 2, "tracks": [["t1", "person", [0.55, 0.48, 0.04, 0.08]]]},
+    {"t": 3, "tracks": [["t1", "person", [0.65, 0.48, 0.04, 0.08]]]}
+  ],
+  "expect": [
+    {"rule_type": "loitering", "rule_id": "bench-2", "never_fires": true}
+  ]
+}

@@ -1,8 +1,11 @@
 # Golden replays (R3.5 seed)
 
-Deterministic rule fixtures replayed by `tests/test_rule_replays.py` through the
-**real** worker path — `rule_engine_from_json` + `RuleEngine.evaluate` — with no
-mocks and no test-only code paths. A fixture proves operator-visible behavior.
+Deterministic rule fixtures replayed through the **same shared core**
+(`packages/ai/replay.py`) by all three consumers — the pytest runner
+(`tests/test_rule_replays.py`), the CLI (`scripts/rule_replay.py`), and the
+dry-run API (`POST /api/rules/test`) — always through the real
+`RuleEngine`, no mocks and no test-only code paths. A fixture proves
+operator-visible behavior.
 
 ## Fixture format (grammar v1)
 
