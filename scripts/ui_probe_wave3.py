@@ -30,8 +30,10 @@ import json
 import os
 import secrets
 import ssl
+import struct
 import sys
 import urllib.request
+import zlib
 from pathlib import Path
 
 from playwright.sync_api import sync_playwright
@@ -85,6 +87,48 @@ def api(path: str, token: str, method: str = "GET", body: dict | None = None):
                                headers={"Content-Type": "application/json",
                                         "Authorization": f"Bearer {token}"})
     return json.loads(urllib.request.urlopen(r).read())
+
+
+def _synthetic_face_png(size: int = 64) -> bytes:
+    """A tiny, valid PNG for the reference-upload flow.
+
+    The old hand-rolled hex fixture had a truncated IDAT and ffmpeg rejected
+    it, so the API's decode guard correctly returned 422 and the upload
+    assertion could never pass.
+    """
+    raw = b"".join(
+        b"\x00" + bytes([min(255, x * 4), min(255, y * 4), 128])
+        for y in range(size) for x in range(size))
+
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        return (struct.pack(">I", len(data)) + kind + data +
+                struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF))
+
+    return (b"\x89PNG\r\n\x1a\n" +
+            chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 2, 0, 0, 0)) +
+            chunk(b"IDAT", zlib.compress(raw, 9)) +
+            chunk(b"IEND", b""))
+
+
+def _clear_of_toasts(page) -> None:
+    """Wait until no transient toast can intercept the next click.
+
+    The success notice for the previous action overlaps the row actions; a
+    click fired through it hits the notice, not the button.
+    """
+    page.wait_for_function("() => document.querySelectorAll('.toast').length === 0",
+                           timeout=10000)
+
+
+def _count_reaches(page, selector: str, expected: int, timeout: int = 8000) -> bool:
+    """Poll a DOM count instead of trusting a fixed settle delay."""
+    try:
+        page.wait_for_function(
+            f"() => document.querySelectorAll({json.dumps(selector)}).length === {expected}",
+            timeout=timeout)
+        return True
+    except Exception:
+        return False
 
 
 def login_ui(page, email: str, password: str):
@@ -178,10 +222,14 @@ def main() -> int:
         page.click("[data-act='save-rules']")
         page.wait_for_timeout(1000)
         saved_rules = api(f"/api/cameras/{cam['id']}/rules", boot)["rules"]
+        rule_ids = [r.get("rule_id") for r in saved_rules]
         results["rule_saved_valid"] = (
             isinstance(saved_rules, list) and len(saved_rules) == rules_before + 1
             and saved_rules[-1]["type"] == "loitering"
-            and len(saved_rules[-1]["zone"]) == 3)
+            and len(saved_rules[-1]["zone"]) == 3
+            # no rule_id = the save would collapse same-type rules on replay
+            and bool(saved_rules[-1].get("rule_id"))
+            and len(set(rule_ids)) == len(rule_ids))
 
         # ── 4. wizard (manual path) ───────────────────────────────────
         page.click("#nav button[data-view='cameras']")
@@ -222,10 +270,7 @@ def main() -> int:
         results["ref_metadata_honesty"] = page.locator(
             "text=the photo itself is never stored").count() >= 0  # renders
         png = OUT / "probe-face.png"  # audit dir (gitignored), not /tmp
-        png.write_bytes(bytes.fromhex(
-            "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4"
-            "890000000d49444154789c626001000000ffff03000006000557bfabd40000"
-            "000049454e44ae426082"))
+        png.write_bytes(_synthetic_face_png())
         refs_before = page.locator("[data-ref]").count()
         page.set_input_files("[data-form='ref-upload'] input[type=file]", str(png))
         page.click("[data-act='ref-upload']")
@@ -240,22 +285,28 @@ def main() -> int:
         people_before = page.locator("[data-person]").count()
         page.locator(f"[data-person='{label}'] button").click()
         page.wait_for_selector("[data-act='delete-person']")
+        _clear_of_toasts(page)
         page.click("[data-act='delete-person']")
         page.fill("[data-field='confirm-label']", label)
         page.locator("[data-act='delete-person-confirm']:not([disabled])").click()
-        page.wait_for_timeout(1200)
         results["typed_label_delete_erases"] = (
-            page.locator(f"[data-person='{label}']").count() == 0
-            and page.locator("[data-person]").count() == people_before - 1)
+            _count_reaches(page, f"[data-person='{label}']", 0, timeout=15000)
+            and _count_reaches(page, "[data-person]", people_before - 1,
+                               timeout=15000))
 
         # ── 6. alerts admin ───────────────────────────────────────────
         page.click("#nav button[data-view='alerts']")
         page.wait_for_selector(".route-row")
+        # the routes table renders first; the activity feed is a second async
+        # fetch — wait for its count attribute before asserting on its rows.
+        page.wait_for_selector("[data-role='deliveries'][data-deliveries-count]",
+                               timeout=10000)
         results["routes_render"] = page.locator(".route-row").count() > 0
         results["deliveries_feed"] = page.locator("[data-delivery]").count() > 0
         page.locator("[data-act='test-fire']").first.click()
         page.wait_for_timeout(1500)
         results["test_fire_no_error"] = True  # survived without a page error
+        _clear_of_toasts(page)
         page.click("#route-add")
         page.wait_for_selector("[data-form='route-new']")
         page.select_option("[data-field='rule_type']", "crowd")
@@ -263,33 +314,49 @@ def main() -> int:
         page.fill("[data-field='config']", '{"url": "https://example.com/hook"}')
         routes_before = page.locator(".route-row").count()
         page.click("[data-act='route-create']")
-        page.wait_for_timeout(1200)
-        results["route_created"] = page.locator(".route-row").count() == routes_before + 1
+        results["route_created"] = _count_reaches(page, ".route-row",
+                                                 routes_before + 1, timeout=15000)
+        _clear_of_toasts(page)
         # two-step delete of the new route (last row)
         page.locator(".route-row [data-act='delete-route']").last.click()
         page.locator("[data-act='delete-route-confirm']").click()
-        page.wait_for_timeout(1200)
-        results["route_deleted"] = page.locator(".route-row").count() == routes_before
+        results["route_deleted"] = _count_reaches(page, ".route-row",
+                                                 routes_before, timeout=15000)
+        # R3.6: pin a budget on the section's camera via the API, then the card must
+        # show usage against the cap (all seeded cameras are unlimited by default).
+        boot = admin_token()
+        cams = api("/api/cameras", boot)
+        api(f"/api/cameras/{cams[0]['id']}", boot, method="PUT",
+            body={"alert_budget_per_day": 5})
+        page.click("#nav button[data-view='alerts']")
+        page.wait_for_selector("[data-role='alert-budget']")
+        results["budget_card"] = page.locator("[data-budget-camera]").count() > 0
+        results["budget_used"] = "used today" in (
+            page.locator("[data-role='alert-budget']").inner_text() or "")
 
         # ── 7. users create + typed delete ────────────────────────────
+        # unique email: a fixed address survives any earlier failed run and
+        # makes the delete locator stale before it is drawn.
+        probe_email = f"w3probe-tmp-{secrets.token_hex(3)}@example.com"
         page.click("#nav button[data-view='users']")
         page.wait_for_selector("[data-user]")
         page.evaluate("location.hash = '#/users?new=1'")
         page.wait_for_selector("[data-form='user-new']")
         form = page.locator("[data-form='user-new']")
-        form.locator("[data-field=email]").fill("w3probe-tmp@example.com")
+        form.locator("[data-field=email]").fill(probe_email)
         form.locator("[data-field=name]").fill("Temp Probe")
         form.locator("[data-field=role]").select_option("VIEWER")
         form.locator("[data-field=password]").fill("Tmp-Pw-123456-x")
         page.click("[data-act='user-create']")
-        page.wait_for_timeout(1500)
-        results["user_created"] = page.locator("[data-user='w3probe-tmp@example.com']").count() == 1
-        page.locator("[data-user='w3probe-tmp@example.com'] [data-act='delete-user']").click()
-        page.fill("[data-field=confirm-email]", "w3probe-tmp@example.com")
+        results["user_created"] = _count_reaches(
+            page, f"[data-user='{probe_email}']", 1)
+        _clear_of_toasts(page)
+        page.locator(f"[data-user='{probe_email}'] [data-act='delete-user']").click()
+        page.fill("[data-field=confirm-email]", probe_email)
         page.locator("[data-act='delete-user-confirm']:not([disabled])").click()
         page.wait_for_timeout(1200)
         results["user_deleted_typed_confirm"] = (
-            page.locator("[data-user='w3probe-tmp@example.com']").count() == 0)
+            page.locator(f"[data-user='{probe_email}']").count() == 0)
 
         # ── 8. privacy dashboard ──────────────────────────────────────
         page.click("#nav button[data-view='privacy']")

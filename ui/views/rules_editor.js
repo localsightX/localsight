@@ -31,10 +31,15 @@ const TYPES = [
 const SVG_W = 640;
 const SVG_H = 360;
 
-function specOf(rule) {
+function specOf(rule, i = 0) {
   // Normalize a stored rule spec for the form.
   return {
     type: rule.type,
+    // Preserve the stored id, or synthesize a stable one. The grammar enforces
+    // uniqueness over the EFFECTIVE id and two id-less rules of the same type
+    // collide, so dropping ids here would make a second loitering zone
+    // unsavable (the API correctly answers 400).
+    rule_id: rule.rule_id || `${rule.type}-${i + 1}`,
     a: rule.a ? [...rule.a] : null,
     b: rule.b ? [...rule.b] : null,
     zone: rule.zone ? rule.zone.map((p) => [...p]) : null,
@@ -66,7 +71,7 @@ function validate(rule) {
 
 export function rulesEditor(body, cam) {
   const editable = can("rules:configure");
-  let rules = Array.isArray(cam.rules) ? cam.rules.map(specOf) : [];
+  let rules = Array.isArray(cam.rules) ? cam.rules.map((r, i) => specOf(r, i)) : [];
   let draft = null; // {type, geometry in progress}
   let drawing = false;
 
@@ -229,7 +234,10 @@ export function rulesEditor(body, cam) {
         e.preventDefault();
         const form = e.currentTarget;
         const t = TYPES.find((x) => x.id === typeSel.value);
-        const rule = { type: t.id };
+        // A fresh unique id: the editor allows a second rule of the same type,
+        // and the API rejects duplicate effective ids (they would merge engine
+        // state silently).
+        const rule = { type: t.id, rule_id: `${t.id}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}` };
         if (t.geometry === "line") {
           if (!draft || draft.geometry !== "line" || draft.pts.length !== 2) {
             return toast("Draw the line first: click two points on the snapshot", { tone: "warn" });

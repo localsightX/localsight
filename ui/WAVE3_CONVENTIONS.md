@@ -79,7 +79,10 @@ Every view module in this wave MUST follow these rules — they come from
 - Rules (per camera): `{"camera_id", "rules":[{type,rule_id?,a?,b?,zone?,direction?,dwell_sec?,min_dwell_sec?,stationary_sec?,threshold?,labels?}]}`.
   Types: `line_cross` (a,b points 0..1), `intrusion`/`loitering`/`object_left`/`crowd`
   (zone = [[x,y],…] polygon). PUT validates each spec server-side; 400 detail
-  explains the first bad rule.
+  explains the first bad rule. The editor always sends a unique `rule_id`
+  (stored ids preserved, new ones generated): uniqueness is enforced over the
+  effective id, so two id-less rules of the same type would collide and be
+  rejected.
 - Persons: `GET /api/persons` (now with `faces_enrolled`), `POST /api/persons`,
   `DELETE /api/persons/{id}` (cascade), `GET /api/persons/{id}/references`
   → `{image_bytes_retained:false, references:[{id,model_version,dimension,
