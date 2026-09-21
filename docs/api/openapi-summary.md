@@ -190,6 +190,15 @@ Supported rule types:
 | `object_left` | Object stationary for `stationary_sec` then disappears |
 | `crowd` | Occupancy count exceeding threshold in a zone |
 
+Writes are validated against **rule grammar v1** (`packages/ai/rulegrammar.py`):
+geometry must be normalized `[0,1]`, labels must come from the platform
+vocabulary, and numeric knobs are range-checked. An invalid payload returns
+`400` with `{"message", "schema_version", "errors": ["rules[0].zone: ..."]}`
+field-path errors. Every rule also accepts the engine knobs `cooldown_sec`
+(minimum seconds between fires, 0 = unlimited) and `min_size` (normalized
+bbox-area floor to ignore tiny/far detections). The audit trail records the
+grammar `schema_version` with each write.
+
 ### Use case: Configure a perimeter intrusion zone
 ```bash
 curl -X PUT http://localhost:8000/api/cameras/$CAM/rules \
@@ -202,7 +211,9 @@ curl -X PUT http://localhost:8000/api/cameras/$CAM/rules \
     {"type": "line_cross", "rule_id": "entry-tripwire",
      "a": [0.5, 0.0], "b": [0.5, 1.0], "direction": 1}
   ]}'
-# direction: 1 = left-to-right, -1 = right-to-left, null = both directions
+# direction: 1 / -1 = required crossing sign relative to the a->b line vector,
+# null = any direction. For the vertical a=[0.5,0] -> b=[0.5,1] line below:
+# -1 = left-to-right entry, 1 = right-to-left (verified by tests/replays/).
 ```
 
 ## Live view

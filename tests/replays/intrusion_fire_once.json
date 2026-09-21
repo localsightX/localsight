@@ -1,0 +1,22 @@
+{
+  "camera_id": "cam-replay",
+  "description": "Zone intrusion with a 5 s cooldown: fires on entry, the 2 s re-entry is suppressed, fires again only after the cooldown elapses.",
+  "rules": [
+    {"type": "intrusion", "rule_id": "vault-1",
+     "zone": [[0.4, 0.4], [0.6, 0.4], [0.6, 0.6], [0.4, 0.6]],
+     "cooldown_sec": 5, "labels": ["person"]}
+  ],
+  "frames": [
+    {"t": 0, "tracks": [["t1", "person", [0.48, 0.48, 0.04, 0.08]]]},
+    {"t": 1, "tracks": [["t1", "person", [0.10, 0.10, 0.04, 0.08]]]},
+    {"t": 2, "tracks": [["t1", "person", [0.48, 0.48, 0.04, 0.08]]]},
+    {"t": 3, "tracks": [["t1", "person", [0.48, 0.48, 0.04, 0.08]]]},
+    {"t": 6, "tracks": [["t1", "person", [0.10, 0.10, 0.04, 0.08]]]},
+    {"t": 10, "tracks": [["t1", "person", [0.48, 0.48, 0.04, 0.08]]]}
+  ],
+  "expect": [
+    {"rule_type": "intrusion", "rule_id": "vault-1", "at_frame": 0},
+    {"rule_type": "intrusion", "rule_id": "vault-1", "at_frame": 5},
+    {"rule_type": "intrusion", "rule_id": "vault-1", "not_at_frames": [1, 2, 3, 4]}
+  ]
+}
