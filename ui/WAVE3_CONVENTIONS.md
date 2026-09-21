@@ -91,7 +91,11 @@ Every view module in this wave MUST follow these rules — they come from
 - Alerts: `GET|POST /api/alerts/routes` (RouteCreate: rule_type, camera_id?,
   channel: webhook|email|push|mqtt, enabled, cooldown_sec, config{}),
   `DELETE /api/alerts/routes/{id}`, `POST /api/alerts/test` (test-fire),
-  `GET /api/alerts/events?limit=` (delivery log).
+  `GET /api/alerts/events?limit=` (delivery log), `GET /api/alerts/budget`
+  (R3.6 per-camera daily budget; usage comes from the same analytic-event
+  count the worker seeds from). Budget writes go through
+  `PUT /api/cameras/{id}` with `alert_budget_per_day` (null = platform
+  default, 0 = unlimited, 1-10000).
 - Users: `GET /api/users` ({id,email,full_name,role,is_active,mfa_enabled}),
   `POST /api/users` (email, password ≥12, role ∈ ADMIN|SECURITY_OPERATOR|
   ANALYST|VIEWER, full_name), `DELETE /api/users/{id}`.

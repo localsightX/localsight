@@ -13,7 +13,8 @@ import { fmtDateTime, fmtDuration, shortId } from "../core/format.js";
 import { navigate } from "../core/router.js";
 
 const CHANNELS = ["webhook", "email", "push", "mqtt"];
-const RULE_TYPES = ["line_cross", "intrusion", "loitering", "object_left", "crowd", "presence"];
+const RULE_TYPES = ["line_cross", "intrusion", "loitering", "object_left", "object_removed",
+                    "stopped_vehicle", "crowd", "presence"];
 
 const CONFIG_HINTS = {
   webhook: '{"url": "https://your-hook.example.com/alerts"}',
@@ -92,7 +93,75 @@ async function listRoutes(listEl) {
     render(feed.querySelector("[data-role=delivery-list]"),
       [h("li", { class: "muted" }, "Activity feed unavailable right now.")]);
   }
+  // R3.6 daily alert budget — the cap the worker enforces on fan-out, shown
+  // with today's usage from the same durable count (analytic events since UTC
+  // midnight). Evidence is never capped: only notifications are withheld.
+  wrapper.append(await budgetCard());
   return wrapper;
+}
+
+// ── daily alert budget (R3.6) ─────────────────────────────────────────
+
+async function budgetCard() {
+  const card = h("div", { class: "card", "data-role": "alert-budget" },
+    h("h3", {}, "Daily alert budget"),
+    h("p", { class: "muted" },
+      "Per-camera cap on alert notifications, counted per UTC day — reached caps suppress notifications only. Detections, clips and search results are always kept."),
+    h("ul", { class: "mask-rows", "data-role": "budget-list" }));
+  let data;
+  try {
+    data = await api("/api/alerts/budget");
+  } catch {
+    render(card.querySelector("[data-role=budget-list]"),
+      [h("li", { class: "muted" }, "Budget view requires the alerts:manage permission.")]);
+    return card;
+  }
+  const cams = data.cameras || [];
+  render(card.querySelector("[data-role=budget-list]"), cams.length
+    ? cams.map((c) => budgetRow(c, data.default_limit_per_day))
+    : [h("li", { class: "muted" }, "No cameras configured yet.")]);
+  card.setAttribute("data-budget-count", String(cams.length));
+  return card;
+}
+
+function budgetRow(c, defaultLimit) {
+  const unlimited = c.effective_limit <= 0;
+  const usage = unlimited
+    ? "unlimited"
+    : `${c.used_today} / ${c.effective_limit} used today${c.remaining === 0 ? ", cap reached" : `, ${c.remaining} left`}`;
+  const row = h("li", { class: "mask-row", "data-budget-camera": c.camera_id },
+    h("span", { class: "pill info" }, unlimited ? "no cap" : (c.remaining === 0 ? "capped" : "ok")),
+    h("span", { class: "mask-desc" },
+      h("strong", {}, c.name || shortId(c.camera_id)),
+      h("span", { class: "muted text-xs" },
+        `${usage}${c.limit_per_day === null ? ` (platform default${defaultLimit ? ` ${defaultLimit}` : " unlimited"})` : ""}`)));
+  if (can("camera:configure")) {
+    const input = h("input", {
+      type: "number", min: "0", max: "10000", class: "mono",
+      value: String(c.limit_per_day ?? c.effective_limit ?? 0),
+      "aria-label": `Daily alert budget for ${c.name || c.camera_id}` });
+    const save = h("button", {
+      class: "ghost", "data-act": "budget-save",
+      onClick: async (e) => {
+        const n = Number(input.value);
+        if (!Number.isInteger(n) || n < 0 || n > 10000) {
+          return toast("Budget must be an integer 0-10000", { tone: "error" });
+        }
+        e.currentTarget.disabled = true;
+        try {
+          await api(`/api/cameras/${c.camera_id}`, {
+            method: "PUT", body: JSON.stringify({ alert_budget_per_day: n }) });
+          toast("Alert budget saved", { tone: "ok" });
+          navigate("alerts");
+        } catch (err) {
+          toast(err.message, { tone: "error" });
+          e.currentTarget.disabled = false;
+        }
+      },
+    }, "Save");
+    row.append(h("span", { class: "cam-card-actions" }, input, save));
+  }
+  return row;
 }
 
 function routeRow(r, names) {

@@ -408,6 +408,17 @@ def update_camera(camera_id: str, body: dict, request: Request, db: Session = De
     for f in ("name", "resolution", "fps", "timezone", "privacy_masks", "retention"):
         if f in body:
             setattr(cam, f, body[f])
+    # R3.6: per-camera alert budget. null clears the override (platform default),
+    # 0 means unlimited, and the cap is bounded so a typo cannot silently
+    # silence a camera forever.
+    if "alert_budget_per_day" in body:
+        value = body["alert_budget_per_day"]
+        if value is not None and (isinstance(value, bool) or not isinstance(value, int)
+                                  or not 0 <= value <= 10000):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                                detail="alert_budget_per_day: must be null, 0 (unlimited) "
+                                       "or an integer 1-10000")
+        cam.alert_budget_per_day = value
     # UnsafeUrlError is a 400, not a 500: validate_egress_url raises (it doesn't
     # return False), so an uncaught raise here bypassed the 400 handler above
     # and surfaced as an internal error — leaking stack behavior and breaking

@@ -29,7 +29,9 @@ Base path `/api`. All responses are JSON. All mutating/protected endpoints requi
 | GET/POST | `/api/nvr` | `camera:configure` |
 
 Camera stream URLs are **SSRF-validated** and **encrypted at rest**; they are never
-returned to clients.
+returned to clients. `PUT /api/cameras/{id}` also accepts
+`alert_budget_per_day` (R3.6): `null` = platform default, `0` = unlimited,
+`1-10000` = cap that camera's alert notifications per UTC day.
 
 ### Use case: Provision a VIGI NVR in one call
 ```bash
@@ -315,8 +317,16 @@ curl "http://localhost:8000/api/analytics/search?q=person%20in%20red%20near%20th
 | DELETE | `/api/alerts/routes/{id}` | `alerts:manage` |
 | POST | `/api/alerts/test` | `alerts:manage` |
 | GET | `/api/alerts/events` | `events:view` |
+| GET | `/api/alerts/budget` | `alerts:manage` (per-camera daily budget: limit, used today, remaining) |
 
 Channels: `webhook` (HTTP POST), `email` (SMTP), `mqtt` (publish/subscribe), `push` (ntfy.sh).
+Routing by `rule_type` (`*` matches all) and optional `camera_id` scope.
+
+The daily alert budget (R3.6) caps **notifications** per camera per UTC day
+(`ALERT_BUDGET_PER_CAMERA_PER_DAY`, overridable per camera via
+`PUT /api/cameras/{id}`); `used_today` counts the analytic events stored since
+UTC midnight, so this view and the worker's enforcement read the same number.
+Evidence is never capped: detections, clips and search results are always kept.
 Routing by `rule_type` (`*` matches all) and optional `camera_id` scope.
 
 ### Use case: Route all intrusion alerts to a webhook with 5-minute cooldown

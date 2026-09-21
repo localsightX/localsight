@@ -128,6 +128,9 @@ class Camera(Base):
     # Stored as JSON; consumed by the worker's RuleEngine. Privacy masks live
     # alongside this as geometry the detector skips.
     rules: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # R3.6 daily alert budget: null = platform default (AI_*/ALERT_* setting),
+    # 0 = unlimited, N = cap the camera's alert fan-out at N per UTC day.
+    alert_budget_per_day: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
