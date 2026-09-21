@@ -15,10 +15,11 @@ Contract:
   ints for direction/threshold) WITHOUT injecting or removing keys, so an
   already-valid payload round-trips byte-stable through ``GET /api/cameras``.
 * v1 defines: ids, geometry (normalized points in [0, 1]), direction,
-  dwell/stationary/min-dwell/threshold, label vocabulary, ``cooldown_sec`` and
-  ``min_size`` (both consumed by ``RuleEngine``). Schedule / hysteresis-window
-  / min-confidence knobs arrive with the epics that consume them (R3.2+);
-  versioning makes that addition non-breaking.
+  dwell/stationary/min-dwell/threshold, label vocabulary, ``cooldown_sec``,
+  ``min_size`` and the R3.2 ``id_switch_grace_sec`` (zone rules only — all
+  consumed by ``RuleEngine``). Schedule / hysteresis-window / min-confidence
+  knobs arrive with the epics that consume them (R3.6+); versioning makes
+  that addition non-breaking.
 """
 from __future__ import annotations
 
@@ -147,6 +148,13 @@ def validate_rules(rules) -> list[str]:
         ms = spec.get("min_size")
         if ms is not None:
             _check_num(ms, f"{p}.min_size", 0.0, 0.5, errors)
+        gs = spec.get("id_switch_grace_sec")
+        if gs is not None:
+            if rtype not in ("intrusion", "loitering", "object_left"):
+                errors.append(f"{p}.id_switch_grace_sec: only supported for zone rules "
+                              f"(intrusion, loitering, object_left)")
+            else:
+                _check_num(gs, f"{p}.id_switch_grace_sec", 0.0, 60.0, errors)
     return errors
 
 
@@ -180,7 +188,8 @@ def normalize_rules(rules: list[dict]) -> list[dict]:
                              if isinstance(pt, (list, tuple)) and len(pt) == 2]
             if rtype == "crowd":
                 s["threshold"] = int(s.get("threshold", 10))
-        for k in ("dwell_sec", "stationary_sec", "min_dwell_sec", "cooldown_sec", "min_size"):
+        for k in ("dwell_sec", "stationary_sec", "min_dwell_sec", "cooldown_sec", "min_size",
+                  "id_switch_grace_sec"):
             if s.get(k) is not None:
                 s[k] = float(s[k])
         out.append(s)

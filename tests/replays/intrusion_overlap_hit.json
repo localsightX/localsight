@@ -1,0 +1,18 @@
+{
+  "camera_id": "cam-replay",
+  "description": "Zone hit = centroid OR >=50% bbox coverage (R3.1 acceptance): a box whose centroid sits in the notch but that is ~56% covered by the L-shaped zone fires; a box fully inside the notch stays silent and clears the entry state.",
+  "rules": [
+    {"type": "intrusion", "rule_id": "lzone-1",
+     "zone": [[0.0, 0.0], [1.0, 0.0], [1.0, 0.6], [0.6, 0.6], [0.6, 1.0], [0.0, 1.0]],
+     "labels": ["person"]}
+  ],
+  "frames": [
+    {"t": 0, "tracks": [["t1", "person", [0.5, 0.5, 0.3, 0.3]]]},
+    {"t": 1, "tracks": [["t1", "person", [0.5, 0.5, 0.3, 0.3]]]},
+    {"t": 2, "tracks": [["t1", "person", [0.62, 0.62, 0.15, 0.15]]]}
+  ],
+  "expect": [
+    {"rule_type": "intrusion", "rule_id": "lzone-1", "at_frame": 0},
+    {"rule_type": "intrusion", "rule_id": "lzone-1", "not_at_frames": [1, 2]}
+  ]
+}

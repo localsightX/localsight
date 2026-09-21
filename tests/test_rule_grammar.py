@@ -19,7 +19,8 @@ def test_valid_payload_has_no_errors():
         {"type": "line_cross", "rule_id": "door", "a": [0.5, 0.0], "b": [0.5, 1.0],
          "direction": 1, "cooldown_sec": 5, "labels": ["person"]},
         {"type": "intrusion", "rule_id": "vault", "zone": ZONE, "min_dwell_sec": 2},
-        {"type": "loitering", "rule_id": "wait", "zone": ZONE, "dwell_sec": 30},
+        {"type": "loitering", "rule_id": "wait", "zone": ZONE, "dwell_sec": 30,
+         "id_switch_grace_sec": 2},
         {"type": "object_left", "rule_id": "bag", "zone": ZONE, "stationary_sec": 45},
         {"type": "crowd", "rule_id": "queue", "zone": ZONE, "threshold": 5},
     ]
@@ -47,6 +48,12 @@ def test_valid_payload_has_no_errors():
     ([{"type": "intrusion", "rule_id": "bad id!", "zone": ZONE}], "rule_id"),
     ([{"type": "intrusion", "rule_id": "x", "zone": ZONE, "cooldown_sec": -1}], "cooldown_sec"),
     ([{"type": "intrusion", "rule_id": "x", "zone": ZONE, "min_size": 0.9}], "min_size"),
+    ([{"type": "loitering", "rule_id": "x", "zone": ZONE, "id_switch_grace_sec": -1}],
+     "id_switch_grace_sec"),
+    ([{"type": "loitering", "rule_id": "x", "zone": ZONE, "id_switch_grace_sec": 61}],
+     "id_switch_grace_sec"),
+    ([{"type": "line_cross", "rule_id": "x", "a": [0, 0], "b": [1, 1],
+      "id_switch_grace_sec": 2}], "only supported for zone rules"),
 ])
 def test_invalid_payloads_report_field_paths(payload, frag):
     errs = rg.validate_rules(payload)
@@ -55,11 +62,14 @@ def test_invalid_payloads_report_field_paths(payload, frag):
 
 def test_normalize_roundtrip_is_stable_and_type_coerces():
     rules = [{"type": "line_cross", "rule_id": "d", "a": [0.5, 0], "b": [0.5, 1.0],
-              "direction": 1, "cooldown_sec": 5}]
+              "direction": 1, "cooldown_sec": 5},
+             {"type": "loitering", "rule_id": "w", "zone": ZONE, "dwell_sec": 30,
+              "id_switch_grace_sec": 3}]
     norm = rg.normalize_rules(rules)
     assert norm[0]["a"] == [0.5, 0.0] and isinstance(norm[0]["a"][1], float)
     assert norm[0]["direction"] == 1 and norm[0]["cooldown_sec"] == 5.0
-    assert set(norm[0]) == set(rules[0])  # no key injection / removal
+    assert norm[1]["id_switch_grace_sec"] == 3.0
+    assert all(set(n) == set(r) for n, r in zip(norm, rules, strict=True))  # no key injection
     assert rg.normalize_rules(norm) == norm  # already-normalized payload is a fixed point
 
 

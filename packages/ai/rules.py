@@ -99,6 +99,73 @@ def crossing_direction(prev: Pt, cur: Pt, line_a: Pt, line_b: Pt) -> float:
     return 1.0 if side_cur > side_prev else -1.0
 
 
+# Zone-hit coverage floor — mirrors pipeline._MASK_MIN_OVERLAP so rule zones and
+# privacy masks agree on what "in the zone" means (R3.1 acceptance).
+_ZONE_MIN_OVERLAP = 0.5
+_MAX_DEPARTED = 32        # ID-switch grace tombstone cap (memory bound)
+_INHERIT_REACH_MIN = 0.12  # min normalized center distance for inheritance
+
+
+def polygon_area(poly: List[Pt]) -> float:
+    """Unsigned shoelace area of a simple polygon."""
+    s = 0.0
+    n = len(poly)
+    for i in range(n):
+        x1, y1 = poly[i]
+        x2, y2 = poly[(i + 1) % n]
+        s += x1 * y2 - x2 * y1
+    return abs(s) / 2.0
+
+
+def _clip_polygon(poly: List[Pt], rect: Tuple[float, float, float, float]) -> List[Pt]:
+    """Sutherland-Hodgman clip of `poly` against the bbox rectangle (convex)."""
+    rx, ry, rw, rh = rect
+    corners = ((rx, ry), (rx + rw, ry), (rx + rw, ry + rh), (rx, ry + rh))  # CCW
+
+    def side(p: Pt, a: Pt, b: Pt) -> float:
+        return _orient(a, b, p)
+
+    out = list(poly)
+    n = len(corners)
+    for i in range(n):
+        a, b = corners[i], corners[(i + 1) % n]
+        inp, out = out, []
+        j = len(inp)
+        for k in range(j):
+            p, q = inp[k], inp[(k + 1) % j]
+            pin, qin = side(p, a, b) >= 0, side(q, a, b) >= 0
+            if qin:
+                if not pin:
+                    denom = side(p, a, b) - side(q, a, b)
+                    t = side(p, a, b) / denom if denom else 0.0
+                    out.append((p[0] + t * (q[0] - p[0]), p[1] + t * (q[1] - p[1])))
+                out.append(q)
+            elif pin:
+                denom = side(p, a, b) - side(q, a, b)
+                t = side(p, a, b) / denom if denom else 0.0
+                out.append((p[0] + t * (q[0] - p[0]), p[1] + t * (q[1] - p[1])))
+    return out
+
+
+def bbox_zone_overlap_fraction(
+    bbox: Tuple[float, float, float, float], poly: List[Pt]
+) -> float:
+    """Fraction of `bbox` covered by the zone polygon (both normalized).
+
+    The polygon analogue of pipeline._bbox_overlap_fraction: clip the zone to
+    the bbox rectangle, shoelace the result, divide by the bbox area. Used by
+    the zone-hit predicate so a detection whose centroid sits outside the zone
+    but whose box is majority-covered still counts as inside."""
+    bw, bh = bbox[2], bbox[3]
+    area = bw * bh
+    if area <= 0 or len(poly) < 3:
+        return 0.0
+    clipped = _clip_polygon(poly, bbox)
+    if len(clipped) < 3:
+        return 0.0
+    return min(1.0, polygon_area(clipped) / area)
+
+
 # ── rule definitions ─────────────────────────────────────────────────────────
 @dataclass
 class LineCrossingRule:
@@ -120,6 +187,7 @@ class ZoneIntrusionRule:
     min_dwell_sec: float = 0.0
     cooldown_sec: float = 0.0  # grammar v1: min seconds between fires (0 = unlimited)
     min_size: float = 0.0      # grammar v1: minimum normalized bbox area (w*h)
+    id_switch_grace_sec: float = 0.0  # R3.2: inherit dwell across tracker ID switches
     labels: Tuple[str, ...] = ("person", "vehicle")
 
 
@@ -131,6 +199,7 @@ class LoiteringRule:
     dwell_sec: float = 30.0
     cooldown_sec: float = 0.0  # grammar v1: min seconds between fires (0 = unlimited)
     min_size: float = 0.0      # grammar v1: minimum normalized bbox area (w*h)
+    id_switch_grace_sec: float = 0.0  # R3.2: inherit dwell across tracker ID switches
     labels: Tuple[str, ...] = ("person",)
 
 
@@ -142,6 +211,7 @@ class ObjectLeftRule:
     stationary_sec: float = 30.0
     cooldown_sec: float = 0.0  # grammar v1: min seconds between fires (0 = unlimited)
     min_size: float = 0.0      # grammar v1: minimum normalized bbox area (w*h)
+    id_switch_grace_sec: float = 0.0  # R3.2: inherit dwell across tracker ID switches
     labels: Tuple[str, ...] = ("bag", "package", "person")
 
 
@@ -175,6 +245,7 @@ class RuleEngine:
         self._mem: dict[str, _TrackMem] = {}
         self._crowd_fired: dict = {}
         self._last_fire: dict[tuple[str, str] | str, dt.datetime] = {}  # grammar v1 cooldown
+        self._departed: dict[str, tuple[dt.datetime, _TrackMem]] = {}  # R3.2 grace
 
     def add(self, rule) -> None:
         if not getattr(rule, "camera_id", ""):
@@ -185,10 +256,16 @@ class RuleEngine:
         x, y, w, h = bbox
         return (x + w / 2.0, y + h / 2.0)
 
-    def _track_mem(self, track_id: str) -> _TrackMem:
-        if track_id not in self._mem:
-            self._mem[track_id] = _TrackMem()
-        return self._mem[track_id]
+    def _track_mem(self, track_id: str, bbox=None, ts: dt.datetime | None = None) -> _TrackMem:
+        """Per-track memory. A *new* track id may inherit a departed track's
+        zone dwell state (R3.2 ID-switch grace) when bbox/ts are provided —
+        see ``_inherit_departed``; without them behavior is unchanged."""
+        m = self._mem.get(track_id)
+        if m is None:
+            m = self._inherit_departed(track_id, bbox, ts) if ts is not None else None
+            m = m if m is not None else _TrackMem()
+            self._mem[track_id] = m
+        return m
 
     def _matches(self, rule_labels, label: str) -> bool:
         return not rule_labels or label in rule_labels
@@ -207,6 +284,64 @@ class RuleEngine:
     def _mark_fire(self, key: str, ts: dt.datetime) -> None:
         self._last_fire[key] = ts
 
+    def _grace_max(self) -> float:
+        """Largest configured ID-switch grace across rules (0 disables the
+        tombstone machinery entirely, preserving pre-R3.2 behavior)."""
+        return max((getattr(r, "id_switch_grace_sec", 0.0) or 0.0
+                    for r in self.rules), default=0.0)
+
+    def _zone_hit(self, poly, bbox) -> bool:
+        """Zone hit = center inside OR >= _ZONE_MIN_OVERLAP of the bbox covered.
+
+        Mirrors ``CameraPipeline._is_masked`` so rule zones and privacy masks
+        agree on what "in the zone" means (R3.1 acceptance)."""
+        if point_in_polygon(self._center(bbox), poly):
+            return True
+        return bbox_zone_overlap_fraction(bbox, poly) >= _ZONE_MIN_OVERLAP
+
+    def _inherit_departed(self, track_id: str, bbox, ts: dt.datetime) -> _TrackMem | None:
+        """ID-switch grace (R3.2): a new track id appearing near where a
+        recently-departed track vanished inherits its zone dwell state (entry
+        timestamps + fired flags), so a tracker re-assignment inside a zone
+        neither resets dwell nor double-fires.
+
+        Line-crossing state is deliberately NOT inherited (a new id is a new
+        approach; per-entry hysteresis must re-arm), the tombstone is consumed
+        on inheritance (transfer, not copy), and inheritance requires the new
+        center to be within ``max(_INHERIT_REACH_MIN, w+h)`` of the departed
+        one — detector flicker, not a different object."""
+        if not self._departed or bbox is None:
+            return None
+        cx, cy = bbox[0] + bbox[2] / 2, bbox[1] + bbox[3] / 2
+        reach = max(_INHERIT_REACH_MIN, bbox[2] + bbox[3])
+        grace = self._grace_max()
+        best, best_d = None, None
+        for tid, (dts, dmem) in self._departed.items():
+            if (ts - dts).total_seconds() > grace:
+                continue
+            db = dmem.bbox
+            dx, dy = db[0] + db[2] / 2, db[1] + db[3] / 2
+            d = ((cx - dx) ** 2 + (cy - dy) ** 2) ** 0.5
+            if d <= reach and (best_d is None or d < best_d):
+                best, best_d = tid, d
+        if best is None:
+            return None
+        _, mem = self._departed.pop(best)
+        mem.last_center = None  # never fabricate a line crossing across ids
+        mem.crossed_lines = set()
+        return mem
+
+    def _prune_departed(self, ts: dt.datetime, grace: float) -> None:
+        """Bound the tombstone table: expire past grace, cap at _MAX_DEPARTED."""
+        if not self._departed:
+            return
+        for tid, (dts, _) in list(self._departed.items()):
+            if (ts - dts).total_seconds() > grace:
+                del self._departed[tid]
+        while len(self._departed) > _MAX_DEPARTED:
+            oldest = min(self._departed, key=lambda t: self._departed[t][0])
+            del self._departed[oldest]
+
     def evaluate(
         self,
         tracks: List[Tuple[str, str, Tuple[float, float, float, float]]],
@@ -219,7 +354,7 @@ class RuleEngine:
         seen = set()
         for track_id, label, bbox in tracks:
             seen.add(track_id)
-            m = self._track_mem(track_id)
+            m = self._track_mem(track_id, bbox, ts)
             m.bbox = bbox
             m.label = label
             center = self._center(bbox)
@@ -243,9 +378,13 @@ class RuleEngine:
                 elif rtype == "CrowdCountRule":
                     pass  # handled in a global pass below
         out.extend(self._eval_crowd(tracks, ts))
+        grace = self._grace_max()
         for tid in list(self._mem):
             if tid not in seen:
-                del self._mem[tid]
+                mem = self._mem.pop(tid)
+                if grace > 0 and (mem.inside_zones or mem.loiter_zones):
+                    self._departed[tid] = (ts, mem)  # ID-switch grace tombstone
+        self._prune_departed(ts, grace)
         return out
 
     # ── individual rule evaluators ──────────────────────────────────────────
@@ -266,7 +405,7 @@ class RuleEngine:
 
     def _eval_zone(self, rule, track_id, label, bbox, center, ts, m):
         rid = rule.rule_id
-        inside = point_in_polygon(center, rule.zone)
+        inside = self._zone_hit(rule.zone, bbox)
         if inside:
             if rid not in m.inside_zones:
                 m.inside_zones[rid] = ts
@@ -289,7 +428,7 @@ class RuleEngine:
 
     def _eval_loiter(self, rule, track_id, label, bbox, center, ts, m):
         rid = rule.rule_id
-        inside = point_in_polygon(center, rule.zone)
+        inside = self._zone_hit(rule.zone, bbox)
         if inside:
             if rid not in m.loiter_zones:
                 m.loiter_zones[rid] = ts
@@ -310,12 +449,13 @@ class RuleEngine:
 
     def _eval_object_left(self, rule, track_id, label, bbox, center, ts, m):
         rid = rule.rule_id
-        inside = point_in_polygon(center, rule.zone)
+        inside = self._zone_hit(rule.zone, bbox)
         if inside:
             if rid not in m.loiter_zones:
                 m.loiter_zones[rid] = ts
             dwell = (ts - m.loiter_zones[rid]).total_seconds()
-            if dwell >= rule.stationary_sec and m.loiter_zones.get("_left_fired_" + rid) is not True:
+            if (dwell >= rule.stationary_sec
+                    and m.loiter_zones.get("_left_fired_" + rid) is not True):
                 key = (rid, track_id)
                 if not self._cooldown_ok(key, ts, getattr(rule, "cooldown_sec", 0.0)):
                     return []  # cooldown active: _left_fired_ left unset so a later visit can fire
@@ -343,7 +483,7 @@ class RuleEngine:
                     continue
                 if getattr(rule, "min_size", 0.0) and bbox[2] * bbox[3] < rule.min_size:
                     continue  # grammar v1 min_size: ignore tracks below the area floor
-                if point_in_polygon(self._center(bbox), rule.zone):
+                if self._zone_hit(rule.zone, bbox):
                     count += 1
             fired = self._crowd_fired.get(rule.rule_id, False)
             if (count >= rule.threshold and not fired
@@ -383,14 +523,17 @@ def rule_from_dict(camera_id: str, spec: dict):
             return ZoneIntrusionRule(rid, zone, camera_id,
                                      min_dwell_sec=spec.get("min_dwell_sec", 0.0),
                                      labels=labels or ("person", "vehicle"),
-                                     cooldown_sec=cooldown, min_size=min_size)
+                                     cooldown_sec=cooldown, min_size=min_size,
+                                     id_switch_grace_sec=spec.get("id_switch_grace_sec", 0.0))
         if rtype == "loitering":
             return LoiteringRule(rid, zone, camera_id, dwell_sec=spec.get("dwell_sec", 30.0),
                                  labels=labels or ("person",),
-                                 cooldown_sec=cooldown, min_size=min_size)
+                                 cooldown_sec=cooldown, min_size=min_size,
+                                 id_switch_grace_sec=spec.get("id_switch_grace_sec", 0.0))
         return ObjectLeftRule(rid, zone, camera_id, stationary_sec=spec.get("stationary_sec", 30.0),
                               labels=labels or ("bag", "package"),
-                              cooldown_sec=cooldown, min_size=min_size)
+                              cooldown_sec=cooldown, min_size=min_size,
+                              id_switch_grace_sec=spec.get("id_switch_grace_sec", 0.0))
     if rtype == "crowd":
         return CrowdCountRule(rid, [tuple(p) for p in spec["zone"]], camera_id,
                               threshold=spec.get("threshold", 10), labels=labels or ("person",),
