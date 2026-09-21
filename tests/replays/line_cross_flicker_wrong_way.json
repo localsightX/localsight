@@ -1,0 +1,19 @@
+{
+  "camera_id": "cam-replay",
+  "description": "R3.3: a right-to-left travel (against direction -1) with one noisy frame that jumps across the line must stay silent - the single-segment logic false-fired here with the wrong direction.",
+  "rules": [
+    {"type": "line_cross", "rule_id": "w-1", "a": [0.5, 0.0], "b": [0.5, 1.0],
+     "direction": -1, "labels": ["person"]}
+  ],
+  "frames": [
+    {"t": 0, "tracks": [["t1", "person", [0.63, 0.45, 0.04, 0.08]]]},
+    {"t": 1, "tracks": [["t1", "person", [0.55, 0.45, 0.04, 0.08]]]},
+    {"t": 2, "tracks": [["t1", "person", [0.44, 0.45, 0.04, 0.08]]]},
+    {"t": 3, "tracks": [["t1", "person", [0.56, 0.45, 0.04, 0.08]]]},
+    {"t": 4, "tracks": [["t1", "person", [0.46, 0.45, 0.04, 0.08]]]},
+    {"t": 5, "tracks": [["t1", "person", [0.30, 0.45, 0.04, 0.08]]]}
+  ],
+  "expect": [
+    {"rule_type": "line_cross", "rule_id": "w-1", "never_fires": true}
+  ]
+}
