@@ -16,8 +16,10 @@ Contract:
   already-valid payload round-trips byte-stable through ``GET /api/cameras``.
 * v1 defines: ids, geometry (normalized points in [0, 1]), direction,
   dwell/stationary/min-dwell/threshold, label vocabulary, ``cooldown_sec``,
-  ``min_size`` and the R3.2 ``id_switch_grace_sec`` (zone rules only — all
-  consumed by ``RuleEngine``). Schedule / hysteresis-window / min-confidence
+  ``min_size``, the R3.2 ``id_switch_grace_sec`` (zone rules only), the R3.4
+  ``require_unattended`` (object_left: an attached owner means not abandoned)
+  and the R3.4 ``stopped_vehicle`` type (``stopped_sec`` + ``max_speed``) —
+  all consumed by ``RuleEngine``. Schedule / hysteresis-window / min-confidence
   knobs arrive with the epics that consume them (R3.6+); versioning makes
   that addition non-breaking.
 """
@@ -34,7 +36,7 @@ PLATFORM_LABELS = frozenset({
     "person", "vehicle", "bicycle", "motorcycle", "bus", "truck",
     "animal", "bag", "package",
 })
-RULE_TYPES = ("line_cross", "intrusion", "loitering", "object_left", "crowd")
+RULE_TYPES = ("line_cross", "intrusion", "loitering", "object_left", "crowd", "stopped_vehicle")
 
 
 class RuleGrammarError(ValueError):
@@ -133,6 +135,9 @@ def validate_rules(rules) -> list[str]:
             _check_num(spec.get("stationary_sec", 30.0), f"{p}.stationary_sec", 0.5, 3600.0, errors)
         elif rtype == "crowd":
             _check_num(spec.get("threshold", 10), f"{p}.threshold", 1, 500, errors, integral=True)
+        elif rtype == "stopped_vehicle":
+            _check_num(spec.get("stopped_sec", 30.0), f"{p}.stopped_sec", 0.5, 3600.0, errors)
+            _check_num(spec.get("max_speed", 0.02), f"{p}.max_speed", 0.0, 0.5, errors)
         labels = spec.get("labels")
         if labels is not None:
             if not isinstance(labels, list) or not all(isinstance(x, str) for x in labels):
@@ -148,11 +153,17 @@ def validate_rules(rules) -> list[str]:
         ms = spec.get("min_size")
         if ms is not None:
             _check_num(ms, f"{p}.min_size", 0.0, 0.5, errors)
+        ru = spec.get("require_unattended")
+        if ru is not None:
+            if rtype != "object_left":
+                errors.append(f"{p}.require_unattended: only supported for object_left rules")
+            elif not isinstance(ru, bool):
+                errors.append(f"{p}.require_unattended: must be a boolean")
         gs = spec.get("id_switch_grace_sec")
         if gs is not None:
-            if rtype not in ("intrusion", "loitering", "object_left"):
+            if rtype not in ("intrusion", "loitering", "object_left", "stopped_vehicle"):
                 errors.append(f"{p}.id_switch_grace_sec: only supported for zone rules "
-                              f"(intrusion, loitering, object_left)")
+                              f"(intrusion, loitering, object_left, stopped_vehicle)")
             else:
                 _check_num(gs, f"{p}.id_switch_grace_sec", 0.0, 60.0, errors)
     return errors
@@ -189,7 +200,7 @@ def normalize_rules(rules: list[dict]) -> list[dict]:
             if rtype == "crowd":
                 s["threshold"] = int(s.get("threshold", 10))
         for k in ("dwell_sec", "stationary_sec", "min_dwell_sec", "cooldown_sec", "min_size",
-                  "id_switch_grace_sec"):
+                  "id_switch_grace_sec", "stopped_sec", "max_speed"):
             if s.get(k) is not None:
                 s[k] = float(s[k])
         out.append(s)

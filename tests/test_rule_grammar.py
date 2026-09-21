@@ -21,8 +21,11 @@ def test_valid_payload_has_no_errors():
         {"type": "intrusion", "rule_id": "vault", "zone": ZONE, "min_dwell_sec": 2},
         {"type": "loitering", "rule_id": "wait", "zone": ZONE, "dwell_sec": 30,
          "id_switch_grace_sec": 2},
-        {"type": "object_left", "rule_id": "bag", "zone": ZONE, "stationary_sec": 45},
+        {"type": "object_left", "rule_id": "bag", "zone": ZONE, "stationary_sec": 45,
+         "require_unattended": True},
         {"type": "crowd", "rule_id": "queue", "zone": ZONE, "threshold": 5},
+        {"type": "stopped_vehicle", "rule_id": "nostop", "zone": ZONE,
+         "stopped_sec": 20, "max_speed": 0.03, "cooldown_sec": 30},
     ]
     assert rg.validate_rules(rules) == []
 
@@ -54,6 +57,14 @@ def test_valid_payload_has_no_errors():
      "id_switch_grace_sec"),
     ([{"type": "line_cross", "rule_id": "x", "a": [0, 0], "b": [1, 1],
       "id_switch_grace_sec": 2}], "only supported for zone rules"),
+    ([{"type": "stopped_vehicle", "rule_id": "x", "zone": ZONE, "stopped_sec": 0.1}],
+     "stopped_sec"),
+    ([{"type": "stopped_vehicle", "rule_id": "x", "zone": ZONE, "max_speed": 0.9}],
+     "max_speed"),
+    ([{"type": "line_cross", "rule_id": "x", "a": [0, 0], "b": [1, 1],
+      "require_unattended": True}], "only supported for object_left"),
+    ([{"type": "object_left", "rule_id": "x", "zone": ZONE, "require_unattended": "yes"}],
+     "must be a boolean"),
 ])
 def test_invalid_payloads_report_field_paths(payload, frag):
     errs = rg.validate_rules(payload)

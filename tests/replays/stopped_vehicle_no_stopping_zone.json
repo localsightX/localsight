@@ -1,0 +1,24 @@
+{
+  "camera_id": "cam-replay",
+  "description": "R3.4 stopped vehicle: a car drives into the no-stopping zone and parks (frames 2-7); once the trajectory window shows ~0 speed for stopped_sec 3 it fires exactly once at frame 7.",
+  "rules": [
+    {"type": "stopped_vehicle", "rule_id": "nostop-1",
+     "zone": [[0.4, 0.4], [0.6, 0.4], [0.6, 0.6], [0.4, 0.6]],
+     "stopped_sec": 3, "max_speed": 0.02, "labels": ["vehicle"]}
+  ],
+  "frames": [
+    {"t": 0, "tracks": [["v1", "vehicle", [0.42, 0.45, 0.10, 0.10]]]},
+    {"t": 1, "tracks": [["v1", "vehicle", [0.46, 0.45, 0.10, 0.10]]]},
+    {"t": 2, "tracks": [["v1", "vehicle", [0.50, 0.45, 0.10, 0.10]]]},
+    {"t": 3, "tracks": [["v1", "vehicle", [0.50, 0.45, 0.10, 0.10]]]},
+    {"t": 4, "tracks": [["v1", "vehicle", [0.50, 0.45, 0.10, 0.10]]]},
+    {"t": 5, "tracks": [["v1", "vehicle", [0.50, 0.45, 0.10, 0.10]]]},
+    {"t": 6, "tracks": [["v1", "vehicle", [0.50, 0.45, 0.10, 0.10]]]},
+    {"t": 7, "tracks": [["v1", "vehicle", [0.50, 0.45, 0.10, 0.10]]]}
+  ],
+  "expect": [
+    {"rule_type": "stopped_vehicle", "rule_id": "nostop-1", "at_frame": 7},
+    {"rule_type": "stopped_vehicle", "rule_id": "nostop-1",
+     "not_at_frames": [0, 1, 2, 3, 4, 5, 6]}
+  ]
+}

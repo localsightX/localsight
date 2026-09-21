@@ -1,0 +1,21 @@
+{
+  "camera_id": "cam-replay",
+  "description": "R3.4 negative: the same car parks for the same duration but OUTSIDE the no-stopping zone — a stopped vehicle outside the zone must never fire.",
+  "rules": [
+    {"type": "stopped_vehicle", "rule_id": "nostop-1",
+     "zone": [[0.4, 0.4], [0.6, 0.4], [0.6, 0.6], [0.4, 0.6]],
+     "stopped_sec": 3, "max_speed": 0.02, "labels": ["vehicle"]}
+  ],
+  "frames": [
+    {"t": 0, "tracks": [["v1", "vehicle", [0.10, 0.45, 0.10, 0.10]]]},
+    {"t": 1, "tracks": [["v1", "vehicle", [0.14, 0.45, 0.10, 0.10]]]},
+    {"t": 2, "tracks": [["v1", "vehicle", [0.18, 0.45, 0.10, 0.10]]]},
+    {"t": 3, "tracks": [["v1", "vehicle", [0.18, 0.45, 0.10, 0.10]]]},
+    {"t": 4, "tracks": [["v1", "vehicle", [0.18, 0.45, 0.10, 0.10]]]},
+    {"t": 5, "tracks": [["v1", "vehicle", [0.18, 0.45, 0.10, 0.10]]]},
+    {"t": 6, "tracks": [["v1", "vehicle", [0.18, 0.45, 0.10, 0.10]]]}
+  ],
+  "expect": [
+    {"rule_type": "stopped_vehicle", "rule_id": "nostop-1", "never_fires": true}
+  ]
+}

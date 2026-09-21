@@ -188,8 +188,9 @@ Supported rule types:
 | `line_cross` | Directional tripwire crossing (R3.3: direction from a ≥3-sample trajectory window, so a jittery detection cannot flip it) |
 | `intrusion` | Polygon zone entry detection |
 | `loitering` | Dwell time exceeding threshold within a zone |
-| `object_left` | Object stationary for `stationary_sec` then disappears |
+| `object_left` | Object stationary for `stationary_sec`, **only while unattended** (R3.4: an attached person/vehicle means not abandoned; `require_unattended: false` restores stationarity-only) |
 | `crowd` | Occupancy count exceeding threshold in a zone |
+| `stopped_vehicle` | R3.4: vehicle at/below `max_speed` for `stopped_sec` inside a no-stopping zone |
 
 Writes are validated against **rule grammar v1** (`packages/ai/rulegrammar.py`):
 geometry must be normalized `[0,1]`, labels must come from the platform
@@ -199,7 +200,9 @@ field-path errors. Every rule also accepts the engine knobs `cooldown_sec`
 (minimum seconds between fires, 0 = unlimited) and `min_size` (normalized
 bbox-area floor to ignore tiny/far detections); zone rules additionally accept
 `id_switch_grace_sec` (R3.2: dwell state carries across a tracker ID switch
-inside the zone, so re-assigned tracks neither reset dwell nor double-fire).
+inside the zone, so re-assigned tracks neither reset dwell nor double-fire),
+`object_left` accepts `require_unattended` (R3.4) and `stopped_vehicle` accepts
+`stopped_sec` / `max_speed` (R3.4).
 A zone hit means the detection centroid is inside the polygon OR at least 50%
 of the detection box is covered by it — the same coverage semantics as privacy
 masks. The audit trail records the grammar `schema_version` with each write.
