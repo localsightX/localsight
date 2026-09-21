@@ -1,0 +1,21 @@
+{
+  "camera_id": "cam-replay",
+  "description": "A bag left in the zone turns stationary (object_left at 4 s), then moves out — object_removed fires once.",
+  "rules": [
+    {"type": "object_left", "rule_id": "leftbehind-1",
+     "zone": [[0.4, 0.4], [0.6, 0.4], [0.6, 0.6], [0.4, 0.6]],
+     "stationary_sec": 4, "labels": ["bag", "package"]}
+  ],
+  "frames": [
+    {"t": 0, "tracks": [["bag1", "bag", [0.48, 0.48, 0.05, 0.05]]]},
+    {"t": 1, "tracks": [["bag1", "bag", [0.48, 0.48, 0.05, 0.05]]]},
+    {"t": 2, "tracks": [["bag1", "bag", [0.48, 0.48, 0.05, 0.05]]]},
+    {"t": 3, "tracks": [["bag1", "bag", [0.48, 0.48, 0.05, 0.05]]]},
+    {"t": 4, "tracks": [["bag1", "bag", [0.48, 0.48, 0.05, 0.05]]]},
+    {"t": 5, "tracks": [["bag1", "bag", [0.80, 0.48, 0.05, 0.05]]]}
+  ],
+  "expect": [
+    {"rule_type": "object_left", "rule_id": "leftbehind-1", "at_frame": 4},
+    {"rule_type": "object_removed", "rule_id": "leftbehind-1", "at_frame": 5}
+  ]
+}

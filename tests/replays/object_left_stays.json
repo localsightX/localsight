@@ -1,0 +1,18 @@
+{
+  "camera_id": "cam-replay",
+  "description": "Negative: a bag passes through in 2 s against stationary_sec 4 — neither object_left nor object_removed fires.",
+  "rules": [
+    {"type": "object_left", "rule_id": "leftbehind-2",
+     "zone": [[0.4, 0.4], [0.6, 0.4], [0.6, 0.6], [0.4, 0.6]],
+     "stationary_sec": 4, "labels": ["bag", "package"]}
+  ],
+  "frames": [
+    {"t": 0, "tracks": [["bag2", "bag", [0.42, 0.48, 0.05, 0.05]]]},
+    {"t": 1, "tracks": [["bag2", "bag", [0.48, 0.48, 0.05, 0.05]]]},
+    {"t": 2, "tracks": [["bag2", "bag", [0.65, 0.48, 0.05, 0.05]]]}
+  ],
+  "expect": [
+    {"rule_type": "object_left", "rule_id": "leftbehind-2", "never_fires": true},
+    {"rule_type": "object_removed", "rule_id": "leftbehind-2", "never_fires": true}
+  ]
+}

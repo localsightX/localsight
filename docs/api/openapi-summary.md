@@ -178,6 +178,7 @@ curl "http://localhost:8000/api/timeline?date=2026-03-01" -H "Authorization: Bea
 |--------|------|-------------|
 | GET | `/api/cameras/{id}/rules` | `rules:configure` |
 | PUT | `/api/cameras/{id}/rules` | `rules:configure` |
+| POST | `/api/rules/test` | `rules:configure` (dry-run replay, no persistence) |
 
 Rules are stored as JSON on the camera and evaluated by the AI worker per frame.
 Supported rule types:
@@ -202,6 +203,15 @@ inside the zone, so re-assigned tracks neither reset dwell nor double-fire).
 A zone hit means the detection centroid is inside the polygon OR at least 50%
 of the detection box is covered by it — the same coverage semantics as privacy
 masks. The audit trail records the grammar `schema_version` with each write.
+
+`POST /api/rules/test` is the R3.5 dry-run replay tester: send draft `rules`
+plus recorded `frames` (`{"t": seconds, "tracks": [["id", "label", [x, y, w, h]],
+...]}`) and get back the verdict timeline — every evaluated decision per frame
+(`fired`, `cooldown_blocked`, `no_zone_hit`, `dwell_warming`, ...) plus the
+fired events, a per-rule summary and, when an `expect` block is supplied, the
+golden-replay verdict (`pass` / `expect_errors`). Nothing is persisted and no
+alert fan-out occurs; the same core backs `scripts/rule_replay.py` (CLI) and
+the `tests/replays/` pytest suite.
 
 ### Use case: Configure a perimeter intrusion zone
 ```bash

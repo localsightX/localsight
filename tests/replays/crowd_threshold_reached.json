@@ -1,0 +1,22 @@
+{
+  "camera_id": "cam-replay",
+  "description": "Crowd count reaches threshold 3 at t=1 and fires once; the count dropping back to 2 re-arms it.",
+  "rules": [
+    {"type": "crowd", "rule_id": "queue-1",
+     "zone": [[0.4, 0.4], [0.6, 0.4], [0.6, 0.6], [0.4, 0.6]],
+     "threshold": 3, "labels": ["person"]}
+  ],
+  "frames": [
+    {"t": 0, "tracks": [["p1", "person", [0.44, 0.48, 0.04, 0.08]],
+                        ["p2", "person", [0.54, 0.48, 0.04, 0.08]]]},
+    {"t": 1, "tracks": [["p1", "person", [0.44, 0.48, 0.04, 0.08]],
+                        ["p2", "person", [0.54, 0.48, 0.04, 0.08]],
+                        ["p3", "person", [0.48, 0.54, 0.04, 0.08]]]},
+    {"t": 2, "tracks": [["p1", "person", [0.44, 0.48, 0.04, 0.08]],
+                        ["p2", "person", [0.54, 0.48, 0.04, 0.08]]]}
+  ],
+  "expect": [
+    {"rule_type": "crowd", "rule_id": "queue-1", "at_frame": 1},
+    {"rule_type": "crowd", "rule_id": "queue-1", "not_at_frames": [0, 2]}
+  ]
+}
