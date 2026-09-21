@@ -185,7 +185,7 @@ Supported rule types:
 
 | Type | Description |
 |------|-------------|
-| `line_cross` | Directional tripwire crossing (configurable entry/exit direction) |
+| `line_cross` | Directional tripwire crossing (R3.3: direction from a ≥3-sample trajectory window, so a jittery detection cannot flip it) |
 | `intrusion` | Polygon zone entry detection |
 | `loitering` | Dwell time exceeding threshold within a zone |
 | `object_left` | Object stationary for `stationary_sec` then disappears |

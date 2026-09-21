@@ -20,6 +20,8 @@ and event-store layers consume.
 from __future__ import annotations
 
 import datetime as dt
+from collections import deque
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
@@ -42,6 +44,8 @@ _RULE_TYPE_NAMES = {
     "CrowdCountRule": "crowd",
 }
 _TRACE_MAX = 10000  # verdict-trace cap so a pathological dry-run cannot balloon
+_DIR_MIN_SAMPLES = 3  # R3.3: direction from a >=3-sample trajectory window
+_DIR_WINDOW = 4       # bounded per-track center history (deque maxlen)
 
 
 @dataclass
@@ -93,20 +97,40 @@ def segments_intersect(p1: Pt, p2: Pt, p3: Pt, p4: Pt) -> bool:
     return False
 
 
+def signed_side(p: Pt, line_a: Pt, line_b: Pt) -> float:
+    """Signed side of ``p`` relative to the a->b line (crossing_direction's
+    convention: +1 reported when the side value increases)."""
+    return (line_b[0] - line_a[0]) * (p[1] - line_a[1]) - (
+        line_b[1] - line_a[1]
+    ) * (p[0] - line_a[0])
+
+
 def crossing_direction(prev: Pt, cur: Pt, line_a: Pt, line_b: Pt) -> float:
     """Sign of the cross product telling which side of the line we moved to.
 
     +1 / -1 encode the two traversal directions; used to honor directional
     tripwires (e.g. only alarm when entering, not when leaving)."""
-    side_prev = (line_b[0] - line_a[0]) * (prev[1] - line_a[1]) - (
-        line_b[1] - line_a[1]
-    ) * (prev[0] - line_a[0])
-    side_cur = (line_b[0] - line_a[0]) * (cur[1] - line_a[1]) - (
-        line_b[1] - line_a[1]
-    ) * (cur[0] - line_a[0])
+    side_prev = signed_side(prev, line_a, line_b)
+    side_cur = signed_side(cur, line_a, line_b)
     if side_prev == 0 and side_cur == 0:
         return 0.0
     return 1.0 if side_cur > side_prev else -1.0
+
+
+def crossing_direction_window(history: Sequence[Pt], line_a: Pt, line_b: Pt) -> float | None:
+    """Net traversal direction over a trajectory window (R3.3, >= 3 samples).
+
+    Compares the signed side of the earliest vs the latest sample, so a single
+    jittery detection cannot flip the reported direction. Returns None when
+    fewer than ``_DIR_MIN_SAMPLES`` points are available or the net
+    displacement is zero (genuinely ambiguous) - callers fall back to
+    ``crossing_direction`` on the crossing segment itself."""
+    if len(history) < _DIR_MIN_SAMPLES:
+        return None
+    delta = signed_side(history[-1], line_a, line_b) - signed_side(history[0], line_a, line_b)
+    if delta == 0:
+        return None
+    return 1.0 if delta > 0 else -1.0
 
 
 # Zone-hit coverage floor — mirrors pipeline._MASK_MIN_OVERLAP so rule zones and
@@ -239,6 +263,7 @@ class CrowdCountRule:
 @dataclass
 class _TrackMem:
     last_center: Optional[Pt] = None
+    history: deque = field(default_factory=lambda: deque(maxlen=_DIR_WINDOW))  # R3.3
     inside_zones: dict = field(default_factory=dict)  # rule_id -> first entered ts
     loiter_zones: dict = field(default_factory=dict)  # rule_id -> first entered ts
     crossed_lines: set = field(default_factory=set)  # rule_ids already fired (hysteresis)
@@ -356,6 +381,7 @@ class RuleEngine:
         _, mem = self._departed.pop(best)
         mem.last_center = None  # never fabricate a line crossing across ids
         mem.crossed_lines = set()
+        mem.history.clear()  # a new id is a new trajectory
         return mem
 
     def _prune_departed(self, ts: dt.datetime, grace: float) -> None:
@@ -392,6 +418,7 @@ class RuleEngine:
             center = self._center(bbox)
             prev = m.last_center
             m.last_center = center
+            m.history.append(center)
 
             for rule in self.rules:
                 if not self._matches(getattr(rule, "labels", ()), label):
@@ -428,7 +455,12 @@ class RuleEngine:
         if not segments_intersect(prev, cur, rule.a, rule.b):
             self._trace_append(ts, "no_cross", rule, track_id)
             return []
-        direction = crossing_direction(prev, cur, rule.a, rule.b)
+        # R3.3: direction from the trajectory window (>= 3 samples) so one
+        # jittery detection cannot flip it; fall back to the crossing segment
+        # while the track is still building history (or the window is ambiguous).
+        direction = crossing_direction_window(m.history, rule.a, rule.b)
+        if direction is None:
+            direction = crossing_direction(prev, cur, rule.a, rule.b)
         if rule.direction is not None and direction != rule.direction:
             self._trace_append(ts, "direction_mismatch", rule, track_id, got=direction)
             return []
@@ -437,9 +469,10 @@ class RuleEngine:
             self._trace_append(ts, "already_fired", rule, track_id)
             return []  # hysteresis: one event per entry
         m.crossed_lines.add(rid)
-        self._trace_append(ts, "fired", rule, track_id, direction=direction)
+        self._trace_append(ts, "fired", rule, track_id, direction=direction,
+                           window=len(m.history))
         return [AnalyticEvent(rid, EVENT_LINE_CROSS, self.camera_id, track_id, label, bbox, ts,
-                               detail={"direction": direction})]
+                               detail={"direction": direction, "window": len(m.history)})]
 
     def _eval_zone(self, rule, track_id, label, bbox, center, ts, m):
         rid = rule.rule_id
