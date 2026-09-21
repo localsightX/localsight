@@ -183,6 +183,7 @@ All config is via environment (see `.env.example`). Highlights:
 | `STORAGE_BACKEND` | `local` | `local` \| `s3`. |
 | `STORAGE_LOCAL_ROOT` | `./data/storage` | Local recording/snapshot store. |
 | `ALERT_WEBHOOK_URL` | `""` | Optional global fallback webhook for all events. |
+| `ALERT_BUDGET_PER_CAMERA_PER_DAY` | `0` | Per-camera alert-notification cap per UTC day (`0` = unlimited); overridable per camera. Notifications only — events/clips are always stored. |
 | `LOCALSIGHT_LIVE_DIR` | `./data/live` | Directory for transcoded live HLS segments (served at `/live-media`). |
 
 ## Camera / NVR compatibility

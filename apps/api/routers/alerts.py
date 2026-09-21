@@ -16,7 +16,8 @@ from sqlalchemy.orm import Session
 from apps.api.audit import write_audit
 from apps.api.bootstrap import Runtime
 from apps.api.dependencies import get_current_user, get_db, get_runtime, require_permission
-from packages.domain.models import AlertRoute, Event, User
+from packages.domain.alertcount import count_alerts_today
+from packages.domain.models import AlertRoute, Camera, Event, User
 from packages.domain.timeutil import iso
 from packages.notify import Alert, MqttNotifier, PushNotifier, WebhookNotifier
 from packages.security.errors import UnsafeUrlError
@@ -188,6 +189,30 @@ def test_alert(db: Session = Depends(get_db), rt: Runtime = Depends(get_runtime)
         except Exception:  # noqa: BLE001 - a delivery failure must not 500 the API
             continue
     return {"delivered": delivered}
+
+
+@router.get("/alerts/budget", dependencies=[Depends(require_permission("alerts:manage"))])
+def alert_budget(rt: Runtime = Depends(get_runtime), db: Session = Depends(get_db)):
+    """Per-camera daily alert budget (R3.6): limit, usage today, remaining.
+
+    ``used_today`` counts the analytic events the pipeline stored since UTC
+    midnight — the same durable source the worker seeds its fan-out gate with,
+    so this view and the enforcement can never disagree. The cap itself gates
+    notifications only; event evidence is always stored."""
+    default_limit = rt.settings.alert_budget_per_camera_per_day
+    rows = []
+    for cam in db.query(Camera).order_by(Camera.name).all():
+        limit = (cam.alert_budget_per_day if cam.alert_budget_per_day is not None
+                 else default_limit)
+        used = count_alerts_today(db, cam.id)
+        rows.append({
+            "camera_id": cam.id, "name": cam.name,
+            "limit_per_day": cam.alert_budget_per_day,  # null = platform default
+            "effective_limit": limit,                  # 0 = unlimited
+            "used_today": used,
+            "remaining": None if limit <= 0 else max(0, limit - used),
+        })
+    return {"default_limit_per_day": default_limit, "window": "UTC day", "cameras": rows}
 
 
 @router.get("/alerts/events", dependencies=[Depends(require_permission("events:view"))])

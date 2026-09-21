@@ -24,6 +24,13 @@ class Settings(BaseSettings):
     cors_allow_origins: str = ""
     ssrf_allowlist: str = ""
 
+    # R3.6 alert hygiene: per-camera alerts-per-UTC-day cap. 0 = unlimited (the
+    # pre-R3.6 default, so an upgrade changes nothing until an operator sets a
+    # budget); a per-camera ``alert_budget_per_day`` column overrides it. The cap
+    # gates *notifications* only — analytic events (and their clips) are always
+    # stored.
+    alert_budget_per_camera_per_day: int = 0
+
     access_token_ttl_min: int = 15
     refresh_token_ttl_days: int = 7
     max_login_attempts: int = 5

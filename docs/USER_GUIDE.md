@@ -449,16 +449,26 @@ scope, and `cooldown_sec` to suppress re-firing storms.
   the encrypted plate — that data stays on the host.
 - `POST /api/alerts/test` sends a synthetic alert through every configured
   route so you can verify delivery end-to-end.
+- The **daily alert budget** (R3.6) caps alert *notifications* per camera per
+  UTC day. It defaults to unlimited; set `ALERT_BUDGET_PER_CAMERA_PER_DAY` for
+  the platform default or override one camera in the Alerts screen. A camera
+  that hits its cap stops notifying but keeps every detection, clip and
+  searchable event — evidence is never a budget item.
 
 ### The Alerts screen (Wave 3)
 
-The Alerts view (operators and up) has three parts:
+The Alerts view (operators and up) has four parts:
 
 - **Routes table** — one row per route: channel pill, rule type, camera
   scope (or *all cameras*), cooldown, enabled/paused state. **Test-fire**
   pushes a synthetic alert through that route; **Delete** is two-step.
 - **Deliveries feed** — the last deliveries with timestamps, so you can see
   the route actually firing, not just configured.
+- **Daily alert budget** — one row per camera showing today's usage against
+  its cap (`unlimited` when no cap is set), with an inline editor for
+  `alert_budget_per_day` (`0` = unlimited, `1-10000`). Saving re-renders the
+  Alerts view; the worker picks the new cap when it next (re)starts that
+  camera's pipeline.
 - **+ Add route** — the create form. The `config` JSON field shows a
   per-channel hint (a webhook wants `{"url": ...}`, email wants an address)
   and a note that channel secrets are write-only, like every credential in

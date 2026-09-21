@@ -32,6 +32,7 @@ from packages.ai.pipeline import CameraPipeline
 from packages.ai.rules import rule_engine_from_json
 from packages.ai.tracker import IouTracker
 from packages.domain import timeutil
+from packages.domain.alertcount import count_alerts_today
 from packages.domain.models import (
     AlertRoute,
     AuditLog,
@@ -43,6 +44,7 @@ from packages.domain.models import (
     VideoSegment,
 )
 from packages.notify import Alert, PushNotifier, WebhookNotifier, build_notifier, dispatch
+from packages.notify.budget import DailyAlertBudget
 from packages.observability import disk
 from packages.observability.logging import configure_logging, logging
 from packages.observability.metrics import metrics
@@ -153,6 +155,39 @@ def _build_notifiers(rt, alert: Alert) -> list:
 
 
 _alert_queue: queue.Queue = queue.Queue()
+
+
+def enqueue_analytic_alerts(analytics, camera_id: str, budget=None,
+                            put=_alert_queue.put) -> int:
+    """Fan point-in-time analytic events out to the alert queue (R3.6).
+
+    Returns how many alerts were enqueued. The daily budget gates
+    *notifications*: once a camera's budget is spent, further alerts are
+    suppressed (counted + logged) while the analytic events stay stored —
+    evidence is never a budget item.
+
+    Lives outside the frame loop so the gate is unit-testable without running a
+    camera: ``put`` is injectable and ``analytics`` is any iterable of events.
+    """
+    enqueued = 0
+    for ae in analytics:
+        if budget is not None and not budget.allow(camera_id):
+            metrics.inc("alerts_budget_suppressed_total", labels=f'camera="{camera_id}"')
+            log.warning("daily alert budget spent for %s (%s/day) - suppressing "
+                        "notification; event evidence is still stored",
+                        camera_id, budget.limit_per_day)
+            continue
+        alert = Alert(rule_id=ae.track_id or ae.event_type, rule_type=ae.event_type,
+                      camera_id=ae.camera_id, title=ae.event_type,
+                      message=str(_safe_alert_detail(ae.detail)),
+                      detail=_safe_alert_detail(ae.detail),
+                      ts=ae.timestamp_start.isoformat() if ae.timestamp_start else None)
+        try:
+            put(alert)
+            enqueued += 1
+        except Exception:
+            log.exception("alert enqueue failed for %s", camera_id)
+    return enqueued
 
 
 def _alert_sender(rt, stop: threading.Event) -> None:
@@ -591,6 +626,23 @@ def run_camera(rt, camera: Camera, stop: threading.Event) -> None:
     gateway = StreamGateway(camera.id, make_source, on_status=_on_status)
     log.info("starting pipeline for camera %s (%s)", camera.id, camera.name)
 
+    # R3.6 daily alert budget: cap this camera's alert fan-out per UTC day.
+    # Seeded from today's persisted analytic events so a worker restart cannot
+    # hand out a fresh budget (and the API shows that same count). 0 = unlimited,
+    # which is the pre-R3.6 behavior and the platform default.
+    _budget_limit = (camera.alert_budget_per_day
+                     if getattr(camera, "alert_budget_per_day", None) is not None
+                     else settings.alert_budget_per_camera_per_day)
+    _alert_budget = DailyAlertBudget(_budget_limit)
+    try:
+        with rt.SessionLocal() as _seed_session:
+            _alert_budget.seed(camera.id, count_alerts_today(_seed_session, camera.id))
+    except Exception as exc:
+        log.warning("alert budget seed failed for %s: %s", camera.id, exc)
+    if _alert_budget.limit_per_day:
+        log.info("camera %s alert budget: %s/UTC-day (used %s)",
+                 camera.id, _alert_budget.limit_per_day, _alert_budget.used(camera.id))
+
     # Rolling fps/latency bookkeeping for observability (declared in metrics.py,
     # previously never emitted — see report D-3).
     _fps_window: list[float] = []
@@ -625,18 +677,15 @@ def run_camera(rt, camera: Camera, stop: threading.Event) -> None:
                             labels=f'camera="{camera.id}"')
             for ev in events:
                 log.info("event %s cam=%s identity=%s", ev.id, ev.camera_id, ev.identity_status)
-            # Fan out point-in-time analytic events to alert channels. Detail is
-            # filtered to the third-party-safe keys (no ciphertext leaves the host).
-            for ae in getattr(pipeline, "_last_analytic", []):
-                alert = Alert(rule_id=ae.track_id or ae.event_type, rule_type=ae.event_type,
-                              camera_id=ae.camera_id, title=ae.event_type,
-                              message=str(_safe_alert_detail(ae.detail)),
-                              detail=_safe_alert_detail(ae.detail),
-                              ts=ae.timestamp_start.isoformat() if ae.timestamp_start else None)
-                try:
-                    _alert_queue.put(alert)
-                except Exception:
-                    log.exception("alert enqueue failed for %s", camera.id)
+            # Fan out point-in-time analytic events to alert channels (R3.6: the
+            # per-camera daily budget gates notifications; evidence is stored
+            # regardless). Detail is filtered to the third-party-safe keys (no
+            # ciphertext leaves the host).
+            analytics = getattr(pipeline, "_last_analytic", [])
+            if analytics:
+                enqueue_analytic_alerts(analytics, camera.id, _alert_budget)
+                metrics.set("alerts_budget_used", float(_alert_budget.used(camera.id)),
+                            labels=f'camera="{camera.id}"')
         except Exception:
             session.rollback()
             log.exception("pipeline error for camera %s", camera.id)

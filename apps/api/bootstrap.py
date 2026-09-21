@@ -134,6 +134,7 @@ def _ensure_columns(rt: Runtime) -> None:
         "ALTER TABLE alert_routes ADD COLUMN cooldown_sec INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE events ADD COLUMN detail JSON",
         "ALTER TABLE tracks ADD COLUMN detail JSON",
+        "ALTER TABLE cameras ADD COLUMN alert_budget_per_day INTEGER",
     ]
     for stmt in added:
         try:
