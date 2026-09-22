@@ -170,6 +170,9 @@ cannot carry your session token.
 
 ### The rules editor
 
+![The rules editor: a drawn loitering zone on the snapshot stage, added to the rule list ahead of saving.](img/rules.png)
+
+
 On the Rules tab: pick a rule type, click on the snapshot to place points
 (two points for a tripwire, three or more for a zone polygon — it closes
 itself), set the per-type threshold (dwell seconds, direction, count),
@@ -188,27 +191,76 @@ Nothing is persisted and no alert is sent (`rules:configure` required).
 
 ### Behavior rules
 
-Each camera can carry JSON rules evaluated per frame by the worker
-(`camera:configure` permission):
+Each camera can carry JSON rules evaluated per frame by the worker over
+*tracked objects* (`rules:configure` permission). Six rule types exist, and
+every type accepts the shared grammar knobs `cooldown_sec` (minimum gap between
+fires of the same rule), `min_size` (ignore tracks smaller than this normalized
+area) and `labels` (restrict to these platform labels):
 
-| Rule type | Fires when | `detail` carried on the event |
-|-----------|------------|-------------------------------|
-| `zone_intrusion` | A track enters the polygon | `zone` |
-| `loitering` | Presence inside a zone exceeds the threshold | `dwell_sec`, `zone` |
-| `line_cross` | A track crosses the segment (optional direction) | `direction` |
-| `object_left` | A stationary object appears and persists | `stationary_sec` |
-| `crowd` | Track count in a zone exceeds N | `count`, `zone` |
+| Rule type | Fires when | `detail` carried on the event | Default labels | Type-specific knobs |
+|-----------|------------|-------------------------------|----------------|---------------------|
+| `line_cross` | A track crosses the segment, optionally in one direction only | `direction` | `person`, `vehicle` | `a`, `b` |
+| `intrusion` | A track enters the polygon | `zone` | `person`, `vehicle` | `min_dwell_sec` |
+| `loitering` | Presence inside a zone exceeds the dwell threshold | `dwell_sec`, `zone` | `person` | `dwell_sec` |
+| `object_left` | A stationary object appears and persists — **and** its later removal | `stationary_sec` | `bag`, `package` | `stationary_sec`, `require_unattended` |
+| `crowd` | Track count in a zone exceeds the threshold | `count`, `zone` | `person` | `threshold` |
+| `stopped_vehicle` | A vehicle stops inside a zone past the threshold | `stopped_sec` | `vehicle`, `truck`, `bus`, `motorcycle`, `bicycle` | `stopped_sec`, `max_speed` |
+
+The `object_left` rule emits **two** event kinds: `object_left` when an
+unattended item appears, and `object_removed` when it is taken again.
 
 ```json
 {
   "rules": [
-    {"type": "zone_intrusion", "rule_id": "backyard", "zone": [[0.5,0.3],[1.0,0.3],[1.0,1.0],[0.5,1.0]]},
-    {"type": "line_cross", "rule_id": "entry-tripwire", "a": [0.5,0.0], "b": [0.5,1.0], "direction": 1}
+    {"type": "intrusion", "rule_id": "backyard", "zone": [[0.5,0.3],[1.0,0.3],[1.0,1.0],[0.5,1.0]], "cooldown_sec": 10},
+    {"type": "line_cross", "rule_id": "entry-tripwire", "a": [0.5,0.0], "b": [0.5,1.0], "direction": 1},
+    {"type": "stopped_vehicle", "rule_id": "no-stopping", "zone": [[0.0,0.6],[1.0,0.6],[1.0,1.0],[0.0,1.0]], "stopped_sec": 30}
   ]
 }
 ```
 
-`direction`: `1` left-to-right, `-1` right-to-left, omitted = both.
+`direction`: `1` left-to-right, `-1` right-to-left, omitted = both. All
+coordinates are normalized `[0,1]`, so geometry drawn in the editor maps
+directly onto model output.
+
+### Testing rules before you trust them (R3.5 replay tester)
+
+![Replay & verdict: a golden fixture replayed through the real rule engine renders its PASS banner.](img/rules-verdict.png)
+
+
+Rules are the loudest thing the system does, so they are testable three ways,
+all through the **same** rule engine — no test-only code paths:
+
+- **In the UI** — the Replay & verdict card below the rules editor runs a saved
+  fixture through the real engine as a dry-run and renders a PASS/FAIL banner
+  against the fixture's `expect` block, one lane per rule with fired/blocked
+  marks. It replays the editor's *current* rules, including unsaved edits.
+- **In the API** — `POST /api/rules/test` takes a fixture body and returns the
+  verdict; nothing is persisted and no alert is sent.
+- **In the terminal / CI** — `python scripts/rule_replay.py` replays the
+  bundled golden fixtures in `tests/replays/` (16 manifests covering the
+  cooldown, direction, dwell, abandoned-object and stopped-vehicle edge cases).
+  `--list` shows them; the pytest suite collects them automatically.
+
+A fixture is a `description`, the `rules`, an ordered list of `frames` (each a
+timestamp plus the tracks present), and an exhaustive `expect` block — where a
+rule *must* fire, where it *must not*, and that absent behaviour stays absent.
+See `tests/replays/README.md` for the format.
+
+### The daily alert budget (R3.6)
+
+Each camera has an optional cap on how many analytic alerts it fans out per UTC
+day (`alert_budget_per_day` on the camera, or the platform default). The cap
+gates **notifications only** — the underlying event, clip and snapshot are
+always stored, so a suppressed alert is still a searchable event and evidence is
+never lost. `GET /api/alerts/budget` shows, per camera, the limit, how many
+alerts have been used today, and what remains; the counter is the analytic-event
+count since UTC midnight, which is the same durable number the worker seeds its
+own gate from, so the UI and enforcement can never disagree. Suppressions are
+counted and surfaced (`alerts_budget_suppressed_total`), so "quiet because
+healthy" stays distinguishable from "quiet because budgeted". A limit of `0`
+means unlimited — the default, so an upgrade changes nothing until you set one.
+
 
 ### Per-camera retention
 

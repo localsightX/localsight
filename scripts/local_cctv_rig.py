@@ -22,6 +22,8 @@ Commands:
     status   show process + stream + API health
     verify   programmatic end-to-end checks (prints PASS/FAIL per stage)
     bench    detector latency budgets — R1 exit gate (PASS/FAIL + exit code)
+    soak     72h false-alert gate — R3 exit (counts alert/cam/day, catches a
+             deaf rig; writes .rig/soak/ report; PASS/FAIL + exit code)
     stop     terminate everything the rig started
     watch    tail combined rig logs live (Ctrl-C to detach)
 
@@ -46,6 +48,7 @@ from __future__ import annotations
 import argparse
 import base64
 import contextlib
+import datetime as dt
 import json
 import os
 import secrets
@@ -63,6 +66,7 @@ RIG_DIR = os.path.join(REPO, ".rig")
 LOGS_DIR = os.path.join(RIG_DIR, "logs")
 PIDS_DIR = os.path.join(RIG_DIR, "pids")
 ENV_FILE = os.path.join(RIG_DIR, "env")
+SOAK_DIR = os.path.join(RIG_DIR, "soak")
 
 API_PORT = int(os.environ.get("RIG_PORT", "8000"))
 RTSP_PORT = int(os.environ.get("RIG_RTSP_PORT", "8554"))
@@ -318,9 +322,12 @@ def capture_args(source: str) -> list[str]:
         FFMPEG_BIN, "-hide_banner", "-nostdin", "-loglevel", "warning",
     ]
     if source == "synthetic":
+        # NB: lavfi size values must use the 'x' separator (640x360), never ':'
+        # — a bare ':' starts a new filtergraph option, so 'size=640:360' fails
+        # to parse ("No option name near '360...'") on every ffmpeg build.
         video_in = [
             "-f", "lavfi", "-i", "testsrc2=size=1280x720:rate=30",
-            "-f", "lavfi", "-i", "life=size=640:360:rate=30:mold=10",
+            "-f", "lavfi", "-i", "life=size=640x360:rate=30:mold=10",
         ]
         main_map = ["-map", "0:v", "-an"]
         sub_map = ["-map", "1:v", "-an"]
@@ -673,9 +680,414 @@ def cmd_bench(backend: str, iterations: int) -> int:
     print(f"bench: backend={backend} iterations={iterations}")
     cmd = [sys.executable, os.path.join(REPO, "scripts", "bench_detector.py"),
            "--backend", backend, "--iterations", str(iterations)]
-    proc = subprocess.run(cmd, cwd=REPO)  # noqa: S603 - fixed argv, our own script
+    proc = subprocess.run(cmd, cwd=REPO)
     print("bench report rendered above; exit code carries the budget verdict.")
     return proc.returncode
+
+
+# ── soak (R3-Close.1) ───────────────────────────────────────────────────────
+
+
+def _utc_now() -> dt.datetime:
+    return dt.datetime.now(dt.UTC)
+
+
+def _soak_login(base: str, tries: int = 5) -> str:
+    """Login with soak-grade patience.
+
+    ``login()`` raises on a 429 (auth is rate-limited at 1/s burst 10). Over a
+    multi-hour soak a transient lockout is expected, not exceptional — dying
+    there would throw away hours of a 72 h window. Back off and retry instead
+    (the bucket fully refills in ~10 s).
+    """
+    last: Exception | None = None
+    for attempt in range(tries):
+        try:
+            return login(base)
+        except Exception as exc:
+            last = exc
+            if attempt < tries - 1:
+                say(f"login attempt {attempt + 1}/{tries} failed ({exc}); "
+                    "backing off 30 s before retry")
+                time.sleep(30.0)
+    raise RuntimeError(f"soak login failed after {tries} tries: {last}")
+
+
+class _SoakSession:
+    """API session that survives access-token expiry.
+
+    Access tokens live 15 min; a soak runs for hours. Re-login transparently on
+    a 401 so a token rolling over mid-window never aborts the run.
+    """
+
+    def __init__(self, base: str) -> None:
+        self.base = base
+        self.token = _soak_login(base)
+
+    def get(self, path: str, timeout: float = 15.0):
+        try:
+            return http_json("GET", path, self.base, self.token, timeout=timeout)
+        except urllib.error.HTTPError as exc:
+            if exc.code == 401:
+                say("access token expired mid-soak; re-authenticating")
+                self.token = _soak_login(self.base)
+                return http_json("GET", path, self.base, self.token, timeout=timeout)
+            raise
+
+
+class SoakWindow:
+    """Per-camera, per-UTC-day alert accounting over a soak window.
+
+    ``used_today`` from ``GET /api/alerts/budget`` counts analytic events since
+    UTC midnight and *resets at UTC midnight*. A naive running total therefore
+    double-counts every day boundary, and a long window's true rate is hidden
+    inside one average. This class finalizes each UTC day separately so a bursty
+    day cannot hide and days cannot be double-counted.
+
+    The first observed day is *partial* unless the soak began at UTC midnight:
+    it may carry events from before the window opened. Its count is a delta from
+    the baseline captured at soak start, so pre-window events are never charged
+    to the soak.
+    """
+
+    def __init__(self, baseline: dict[str, int] | None = None) -> None:
+        self.baseline = dict(baseline or {})
+        self.day_counts: dict[str, dict[str, int]] = {}
+        self.day_partial: dict[str, bool] = {}
+        self.last_day: str | None = None
+        self.fires_total = 0
+        self._finalized: set[str] = set()
+
+    def sample(self, utc_date: str, cam_id: str, used_today: int) -> None:
+        """Record one budget reading for one camera."""
+        if self.last_day is not None and utc_date != self.last_day:
+            self.finalize_day(self.last_day)
+        if utc_date not in self.day_counts:
+            self.day_counts[utc_date] = {}
+            self.day_partial[utc_date] = self.last_day is None
+            if self.last_day is None:
+                # A camera absent from the soak-start snapshot did not exist
+                # when the window opened, so it has no pre-window events to
+                # exclude — its baseline is 0, not its first observed count.
+                self.baseline.setdefault(cam_id, 0)
+        self.last_day = utc_date
+        if self.day_partial[utc_date]:
+            # Only charge what happened inside the window.
+            self.day_counts[utc_date][cam_id] = max(0, used_today - self.baseline.get(cam_id, 0))
+        else:
+            self.day_counts[utc_date][cam_id] = used_today
+
+    def finalize_day(self, utc_date: str) -> None:
+        """Lock in a day's counts (idempotent — rollover then close)."""
+        if utc_date not in self.day_counts or utc_date in self._finalized:
+            return
+        self._finalized.add(utc_date)
+        total = sum(self.day_counts[utc_date].values())
+        self.fires_total += total
+        kind = "partial" if self.day_partial.get(utc_date) else "full"
+        say(f"UTC day {utc_date} finalized ({kind}): {total} analytic fire(s)")
+
+    def close(self) -> None:
+        """Finalize the in-flight day at soak end."""
+        if self.last_day is not None:
+            self.finalize_day(self.last_day)
+
+    def per_camera_total(self, cam_id: str) -> int:
+        return sum(self.day_counts[d].get(cam_id, 0) for d in self.day_counts)
+
+    def days(self) -> list[str]:
+        return sorted(self.day_counts)
+
+
+def cmd_soak(hours: float, budget_per_cam_day: int, min_fires: int,
+             poll_sec: float, deaf_window_sec: float, tag: str,
+             out_dir: str) -> int:
+    """R3-Close.1: the 72 h false-alert soak, as a reproducible gate.
+
+    The soak is the R3 exit gate because it answers the one question unit tests
+    cannot: with real rules armed on a real scene for days, does the pipeline
+    stay quiet when nothing happens *and* loud when something does?
+
+    Two failure modes both fail the run:
+
+    * **Spam** — more analytic fires than the budget allows, per camera per UTC
+      day (from ``GET /api/alerts/budget`` — the same durable rows the worker
+      seeds its fan-out gate from, so the verdict and runtime budget can never
+      disagree).
+    * **Deafness** — a rig that detects nothing trivially "passes" a quiet
+      budget. Guarded three ways: cameras stay ONLINE, ``last_seen`` keeps
+      advancing (the heartbeat only ticks while frames flow), and at least
+      ``min_fires`` analytic events register (the scripted intrusions).
+
+    The verdict is written to a JSON + markdown artifact, not a spreadsheet, so
+    the gate is reproducible and archivable into `03`.
+    """
+    base = f"http://127.0.0.1:{API_PORT}"
+    if hours <= 0:
+        die("--hours must be positive")
+
+    # Preflight: the soak observes a running rig, it does not boot one. Failing
+    # fast here beats recording hours of "no camera" as a pass.
+    for n in ("mediamtx", "capture", "api", "worker"):
+        if not is_running(n):
+            die(f"rig component '{n}' is not running — start the rig first "
+                "(`python scripts/local_cctv_rig.py start`) then launch the soak")
+    if not _api_alive(base):
+        die("API not responding — check .rig/logs/api.log before soaking")
+
+    session = _SoakSession(base)
+    st, cams = http_json("GET", "/api/cameras", base, session.token)
+    if st != 200 or not cams:
+        die(f"no cameras visible to soak (status {st}); register a camera first")
+    cam_ids = [c["id"] for c in cams]
+    cam_names = {c["id"]: c["name"] for c in cams}
+    say(f"soak target: {len(cam_ids)} camera(s): "
+        + ", ".join(f"{cam_names[c]} ({c})" for c in cam_ids))
+
+    os.makedirs(out_dir, exist_ok=True)
+    started_at = _utc_now()
+    deadline = time.monotonic() + hours * 3600.0
+
+    st, base_budget = session.get("/api/alerts/budget")
+    if st != 200:
+        die(f"alert budget endpoint unavailable (status {st}) — the soak reads "
+            "its counts from here")
+    baseline = {row["camera_id"]: row["used_today"]
+                for row in base_budget.get("cameras", [])}
+    window = SoakWindow(baseline)
+
+    prev_last_seen: dict[str, str | None] = {c: None for c in cam_ids}
+    last_seen_advanced: dict[str, float] = {c: time.monotonic() for c in cam_ids}
+    offline_events: dict[str, int] = {c: 0 for c in cam_ids}
+    deaf_intervals: dict[str, list[float]] = {c: [] for c in cam_ids}
+    samples = 0
+
+    say(f"soak START {started_at.isoformat()} — {hours:g} h, budget "
+        f"{budget_per_cam_day} alert/cam/day, min {min_fires} fire(s), "
+        f"poll {poll_sec:g} s")
+    say("operator: perform the scripted intrusions during the window; the soak "
+        "asserts they register (a deaf rig fails the gate, never passes it)")
+
+    try:
+        while time.monotonic() < deadline:
+            now = _utc_now()
+            try:
+                st, bud = session.get("/api/alerts/budget")
+                stc, cam_rows = session.get("/api/cameras")
+            except Exception as exc:
+                say(f"poll failed ({exc}); continuing — a missed sample is not a "
+                    "failed soak, but repeated failures surface as deafness")
+                time.sleep(poll_sec)
+                continue
+
+            if st == 200:
+                utc_date = now.strftime("%Y-%m-%d")
+                for row in bud.get("cameras", []):
+                    cid = row["camera_id"]
+                    if cid in cam_ids:
+                        window.sample(utc_date, cid, int(row.get("used_today") or 0))
+
+            if stc == 200:
+                for cam in cam_rows:
+                    cid = cam["id"]
+                    if cid not in cam_ids:
+                        continue
+                    if cam["status"] != "ONLINE":
+                        offline_events[cid] = offline_events.get(cid, 0) + 1
+                    seen = cam.get("last_seen")
+                    if seen and seen != prev_last_seen[cid]:
+                        prev_last_seen[cid] = seen
+                        last_seen_advanced[cid] = time.monotonic()
+                    stale_for = time.monotonic() - last_seen_advanced[cid]
+                    if stale_for > deaf_window_sec:
+                        deaf_intervals[cid].append(stale_for)
+
+            samples += 1
+            time.sleep(poll_sec)
+    except KeyboardInterrupt:
+        say("interrupted by operator — finalizing a partial report")
+    finally:
+        window.close()
+
+    ended_at = _utc_now()
+    elapsed_h = (ended_at - started_at).total_seconds() / 3600.0
+
+    checks, window_rate, _worst, complete = _soak_checks(
+        window=window, cam_ids=cam_ids, cam_names=cam_names,
+        offline_events=offline_events, deaf_intervals=deaf_intervals,
+        budget_per_cam_day=budget_per_cam_day, min_fires=min_fires,
+        elapsed_h=elapsed_h, requested_h=hours,
+        deaf_window_sec=deaf_window_sec,
+    )
+    return _soak_report(
+        window=window, cam_ids=cam_ids, cam_names=cam_names,
+        offline_events=offline_events, deaf_intervals=deaf_intervals,
+        checks=checks, window_rate=window_rate, elapsed_h=elapsed_h,
+        requested_h=hours, samples=samples, started_at=started_at,
+        ended_at=ended_at, tag=tag, out_dir=out_dir, poll_sec=poll_sec,
+        complete=complete, budget_per_cam_day=budget_per_cam_day,
+        min_fires=min_fires,
+    )
+
+
+def _soak_checks(*, window: SoakWindow, cam_ids: list[str],
+                 cam_names: dict[str, str], offline_events: dict[str, int],
+                 deaf_intervals: dict[str, list[float]],
+                 budget_per_cam_day: int, min_fires: int, elapsed_h: float,
+                 requested_h: float, deaf_window_sec: float
+                 ) -> tuple[list[tuple[str, bool, str]], float, float, bool]:
+    """Evaluate every soak assertion. Returns (checks, window_rate, worst, complete).
+
+    Pure: no I/O, so the gate logic is unit-testable against a synthetic window.
+    """
+    elapsed_days = max(elapsed_h / 24.0, 1e-9)
+    checks: list[tuple[str, bool, str]] = []
+
+    def check(name: str, ok: bool, note: str = "") -> None:
+        checks.append((name, ok, note))
+        print(f"  {'PASS' if ok else 'FAIL'}  {name}{'  ' + note if note else ''}")
+
+    print("soak verdict:")
+    # A partial run cannot certify a 72 h gate — but it still reports, so an
+    # interrupted soak is diagnosable rather than discarded.
+    complete = elapsed_h >= requested_h * 0.95
+    check(f"soak duration ≥ requested ({requested_h:g} h)", complete,
+          f"elapsed {elapsed_h:.2f} h")
+
+    # 1. Spam guard: per UTC day, no camera exceeds the budget. The partial
+    # first day is scaled to a 24 h rate so a short-but-bursty opening is still
+    # caught, and a burst can never hide behind a favourable average.
+    violations: list[str] = []
+    worst_rate = 0.0
+    days = window.days()
+    for utc_date in days:
+        partial = window.day_partial.get(utc_date)
+        for cid in cam_ids:
+            n = window.day_counts[utc_date].get(cid, 0)
+            if partial and utc_date == days[-1]:
+                span_h = max(min(elapsed_h, 24.0), 1e-9)
+                rate = n / span_h * 24.0
+            else:
+                rate = float(n)
+            worst_rate = max(worst_rate, rate)
+            if rate > budget_per_cam_day:
+                violations.append(f"{cam_names[cid]} day {utc_date}: {n} "
+                                  f"({rate:.2f}/day)")
+    check(f"false-alert budget ≤ {budget_per_cam_day}/cam/day",
+          not violations,
+          "; ".join(violations) if violations else f"worst {worst_rate:.2f}/cam/day")
+
+    # 2. Window-average guard: a bursty day cannot hide inside a quiet week.
+    window_rate = window.fires_total / elapsed_days / max(len(cam_ids), 1)
+    check("window-average within budget", window_rate <= budget_per_cam_day,
+          f"{window_rate:.2f}/cam/day over {elapsed_days:.2f} day(s)")
+
+    # 3. Deafness guards — silence must not pass.
+    offline = {c: n for c, n in offline_events.items() if n}
+    check("cameras stayed ONLINE", not offline,
+          "; ".join(f"{cam_names[c]} offline {n} sample(s)" for c, n in offline.items())
+          or "no offline samples")
+    deaf = {c: iv for c, iv in deaf_intervals.items() if iv}
+    check(f"last_seen advanced (deaf guard, window {deaf_window_sec:g} s)",
+          not deaf,
+          "; ".join(f"{cam_names[c]} stale {max(iv):.0f} s" for c, iv in deaf.items())
+          or "heartbeats current")
+    check(f"scripted intrusions registered (≥{min_fires} fire(s))",
+          window.fires_total >= min_fires,
+          f"{window.fires_total} analytic fire(s) total")
+    return checks, window_rate, worst_rate, complete
+
+
+def _soak_report(*, window: SoakWindow, cam_ids: list[str],
+                 cam_names: dict[str, str], offline_events: dict[str, int],
+                 deaf_intervals: dict[str, list[float]], checks: list,
+                 window_rate: float, elapsed_h: float, requested_h: float,
+                 samples: int, started_at: dt.datetime,
+                 ended_at: dt.datetime, tag: str, out_dir: str,
+                 poll_sec: float, complete: bool, budget_per_cam_day: int,
+                 min_fires: int) -> int:
+    """Assemble the report, archive JSON + markdown, and return the exit code."""
+    per_cam = {
+        cid: {
+            "name": cam_names[cid],
+            "fires_total": window.per_camera_total(cid),
+            "per_utc_day": {d: window.day_counts[d].get(cid, 0)
+                            for d in window.days()},
+            "offline_samples": offline_events.get(cid, 0),
+            "max_stale_sec": (max(deaf_intervals[cid])
+                              if deaf_intervals.get(cid) else 0.0),
+        }
+        for cid in cam_ids
+    }
+    report = {
+        "tag": tag,
+        "started_at": started_at.isoformat(), "ended_at": ended_at.isoformat(),
+        "requested_hours": requested_h, "elapsed_hours": round(elapsed_h, 3),
+        "budget_per_cam_day": budget_per_cam_day,
+        "min_fires_expected": min_fires,
+        "cameras": per_cam,
+        "fires_total": window.fires_total,
+        "window_rate_per_cam_day": round(window_rate, 3),
+        "checks": [{"name": n, "pass": ok, "note": note} for n, ok, note in checks],
+        "verdict": "PASS" if all(ok for _, ok, _ in checks) else "FAIL",
+        "samples": samples,
+        "poll_sec": poll_sec,
+        "note": "complete window" if complete else "partial run",
+    }
+    os.makedirs(out_dir, exist_ok=True)
+    stamp = started_at.strftime("%Y%m%dT%H%M%SZ")
+    json_path = os.path.join(out_dir, f"soak_{tag}_{stamp}.json")
+    with open(json_path, "w") as fh:
+        json.dump(report, fh, indent=2)
+    md_path = os.path.join(out_dir, f"soak_{tag}_{stamp}.md")
+    with open(md_path, "w") as fh:
+        fh.write(_soak_markdown(report))
+    say(f"report → {json_path}")
+    say(f"summary → {md_path}")
+
+    failed = [c for c in checks if not c[1]]
+    print(f"\n{len(checks) - len(failed)}/{len(checks)} soak checks passed "
+          f"({report['verdict']})")
+    if failed:
+        print("failing:", ", ".join(f[0] for f in failed))
+        return 1
+    print("SOAK PASSED — quiet when nothing happened, loud when it did.")
+    return 0
+
+
+def _soak_markdown(report: dict) -> str:
+    """A paste-ready summary, including the `03` KPI row value."""
+    lines = [
+        f"# Soak report — {report['tag']}",
+        "",
+        f"- **Verdict:** {report['verdict']} ({report['note']})",
+        f"- **Window:** {report['started_at']} → {report['ended_at']} "
+        f"({report['elapsed_hours']:g} h of {report['requested_hours']:g} requested)",
+        f"- **Budget:** ≤{report['budget_per_cam_day']} alert/cam/day · "
+        f"expected ≥{report['min_fires_expected']} scripted fire(s)",
+        f"- **Result:** {report['fires_total']} analytic fire(s), "
+        f"{report['window_rate_per_cam_day']}/cam/day window average",
+        "",
+        "## Per camera",
+        "",
+        "| Camera | Fires | Worst day | Offline samples | Max stale (s) |",
+        "|---|---|---|---|---|",
+    ]
+    for cam in report["cameras"].values():
+        worst = max(cam["per_utc_day"].values()) if cam["per_utc_day"] else 0
+        lines.append(f"| {cam['name']} | {cam['fires_total']} | {worst} | "
+                     f"{cam['offline_samples']} | {cam['max_stale_sec']:.0f} |")
+    lines += ["", "## Checks", "", "| Check | Result | Note |", "|---|---|---|"]
+    for chk in report["checks"]:
+        lines.append(f"| {chk['name']} | {'PASS' if chk['pass'] else 'FAIL'} | "
+                     f"{chk['note']} |")
+    lines += [
+        "",
+        f"**`03` KPI paste (false-alert rate):** "
+        f"`{report['window_rate_per_cam_day']} alert/cam/day over "
+        f"{report['elapsed_hours']:g} h ({report['tag']})`",
+    ]
+    return "\n".join(lines) + "\n"
 
 
 def main() -> int:
@@ -694,6 +1106,24 @@ def main() -> int:
                          choices=["none", "onnx", "openvino", "tensorrt"],
                          help="none = pure hot paths only, no staged model needed")
     p_bench.add_argument("--iterations", type=int, default=100)
+    p_soak = sub.add_parser("soak", help="72h false-alert soak (R3 exit gate)")
+    p_soak.add_argument("--hours", type=float, default=72.0,
+                        help="soak window length (fractional ok for smoke tests)")
+    p_soak.add_argument("--budget", type=int, default=1,
+                        dest="budget_per_cam_day",
+                        help="max analytic alerts per camera per UTC day")
+    p_soak.add_argument("--min-fires", type=int, default=2, dest="min_fires",
+                        help="scripted intrusions that MUST fire (deaf-rig guard)")
+    p_soak.add_argument("--poll-sec", type=float, default=60.0, dest="poll_sec",
+                        help="sampling interval for the budget + liveness probes")
+    p_soak.add_argument("--deaf-window-sec", type=float, default=300.0,
+                        dest="deaf_window_sec",
+                        help="last_seen may be stale this long before the run "
+                             "is flagged deaf")
+    p_soak.add_argument("--tag", default="r3",
+                        help="label for the report files (e.g. r3, smoke)")
+    p_soak.add_argument("--out-dir", default=SOAK_DIR, dest="out_dir",
+                        help="where to write soak_*.json / .md reports")
     sub.add_parser("stop", help="tear the rig down")
     sub.add_parser("watch", help="tail all rig logs")
     args = ap.parse_args()
@@ -708,6 +1138,10 @@ def main() -> int:
         return cmd_verify()
     elif args.cmd == "bench":
         return cmd_bench(args.backend, args.iterations)
+    elif args.cmd == "soak":
+        return cmd_soak(args.hours, args.budget_per_cam_day, args.min_fires,
+                        args.poll_sec, args.deaf_window_sec, args.tag,
+                        args.out_dir)
     elif args.cmd == "stop":
         cmd_stop()
     elif args.cmd == "watch":
