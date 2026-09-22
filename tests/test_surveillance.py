@@ -491,6 +491,41 @@ def test_recorder_segment_logic(monkeypatch):
     assert "rtsp://192.168.1.5:554/stream" in spawned["args"]
 
 
+def test_recorder_key_aligns_to_configured_segment_seconds(monkeypatch):
+    """Regression: the recorder's storage key was floored to a hard-coded 300 s
+    bucket while the segment length came from settings. With
+    RECORD_SEGMENT_SECONDS=30 (the local rig) every 30 s segment inside a
+    5-minute window computed the SAME key, so each finalize overwrote the
+    previous clip and the archive served the wrong 30 s window for the others.
+
+    One segment must equal one key, aligned to the configured segment length.
+    """
+    monkeypatch.setattr("packages.video.recorder.validate_egress_url", lambda *a, **k: None)
+    monkeypatch.setattr("packages.video.ffmpeg.validate_egress_url", lambda *a, **k: None)
+    t0 = dt.datetime(2026, 1, 1, 12, 3, 45, tzinfo=dt.UTC)
+
+    class FakeProc:
+        def poll(self): return 0
+        def terminate(self): pass
+
+    # segment_key must honor the seg_seconds it is given, not its 300 s default.
+    assert segment_key("cam1", t0, seg_seconds=30).endswith("/120330.mp4")
+    assert segment_key("cam1", t0, seg_seconds=300).endswith("/120000.mp4")
+
+    # Four consecutive 30 s segments must cut four distinct keys — under the bug
+    # all four collapsed onto ".../120000.mp4" and only the last survived.
+    rec = Recorder("cam1", storage=None, seg_seconds=30, spawn=lambda _a: FakeProc())
+    keys = [
+        rec.record_url("rtsp://192.168.1.5:554/stream",
+                       t0 + dt.timedelta(seconds=30 * i)).storage_key
+        for i in range(4)
+    ]
+    assert [k.rsplit("/", 1)[-1] for k in keys] == [
+        "120330.mp4", "120400.mp4", "120430.mp4", "120500.mp4"
+    ]
+    assert len(set(keys)) == 4
+
+
 # ── ONVIF client (injectable transport) ────────────────────────────────────
 def test_onvif_discover_parse():
     xml = '<d:ProbeMatch><d:XAddrs>rtsp://10.0.0.5/onvif/1</d:XAddrs></d:ProbeMatch>'
