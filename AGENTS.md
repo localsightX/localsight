@@ -150,8 +150,8 @@ tests/           unit + security + API + integration; tests/ui = Playwright e2e
 - **Dev**: SQLite, tests run against an in-memory-ish session-scoped app
   (`conftest.py`); `.venv` at repo root; `pytest tests/ -q` must pass
   (**currently 274 tests** — `test_surveillance.py` carries 113 of
-  them). The UI e2e suite is separate: `pytest tests/ui -m ui` collects 45
-  more (319 total) — it boots a real uvicorn server + seeded throwaway DB and
+  them). The UI e2e suite is separate: `pytest tests/ui -m ui` collects 46
+  more (320 total) — it boots a real uvicorn server + seeded throwaway DB and
   drives it with Playwright (needs `playwright`, `pytest-playwright`,
   chromium, ffmpeg); `pytest tests/` never collects it (deselected via the `ui`
   marker, pytest.ini).
@@ -258,10 +258,10 @@ tests/           unit + security + API + integration; tests/ui = Playwright e2e
 
 ## Quality gates
 
-- `pytest tests/ -q` — all green (**274 passed**, 45 deselected) in ~50 s.
+- `pytest tests/ -q` — all green (**274 passed**, 46 deselected) in ~50 s.
 - `pytest tests/ui -m ui` — the browser suite (Wave 5 + maturity waves); run it
   before merging UI changes (needs chromium via `playwright install`, ffmpeg).
-  45 tests: journeys (12), a11y/axe, CSP console, design tokens, flows,
+  46 tests: journeys (13), a11y/axe, CSP console, design tokens, flows,
   perf budgets, 12-state visual regression.
 - `ruff check .` — `ruff.toml` defines the rule set; keep changed files clean,
   don't mass-reformat untouched files.

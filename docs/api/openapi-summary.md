@@ -216,7 +216,10 @@ plus recorded `frames` (`{"t": seconds, "tracks": [["id", "label", [x, y, w, h]]
 fired events, a per-rule summary and, when an `expect` block is supplied, the
 golden-replay verdict (`pass` / `expect_errors`). Nothing is persisted and no
 alert fan-out occurs; the same core backs `scripts/rule_replay.py` (CLI) and
-the `tests/replays/` pytest suite.
+the `tests/replays/` pytest suite. The Rules editor's **Replay & verdict**
+card calls this endpoint from the UI: pick a fixture file, replay the
+editor's current (unsaved) draft rules, and the PASS/FAIL banner, per-rule
+verdict lanes and fire markers render inline.
 
 ### Use case: Configure a perimeter intrusion zone
 ```bash

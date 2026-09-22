@@ -178,6 +178,14 @@ editor warns when the camera carries legacy/unknown rules so the replace is
 never a silent surprise. Every rule is validated against the same schema
 the worker enforces before the save leaves your browser.
 
+**Replay & verdict** — the card below the editor runs a saved frame fixture
+(`tests/replays/` JSON format) through the *real* detection engine as a
+dry-run and renders the verdict: a PASS/FAIL banner against the fixture's
+`expect` block, one lane per rule with fired/blocked marks, and the
+per-rule fire counts. By default it replays the editor's *current* rules —
+including unsaved edits — so you verify a rule's behavior before saving it.
+Nothing is persisted and no alert is sent (`rules:configure` required).
+
 ### Behavior rules
 
 Each camera can carry JSON rules evaluated per frame by the worker

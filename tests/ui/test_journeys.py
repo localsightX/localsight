@@ -186,3 +186,54 @@ class TestCameraRemovalJourney:
         page.click("#nav button[data-view='cameras']")
         page.wait_for_selector(".cam-grid")
         assert page.locator(".cam-card[data-cam='e2e-keep-me']").count() == 1
+
+
+class TestVerdictTimelineJourney:
+    def test_rule_replay_golden_pass(self, server, logged_in, admin_token):
+        """R3.5 verdict timeline: pick a fixture in the rules editor's replay
+        card, run it, and the golden-replay banner + SVG fire markers render."""
+        import json as _json
+        page = logged_in
+        r = httpx.post(f"{server['base']}/api/cameras",
+                       json={"name": "e2e-verdict-cam"},
+                       headers={"Authorization": f"Bearer {admin_token}"}, timeout=10)
+        assert r.status_code == 200, r.text
+        cam_id = r.json()["id"]
+
+        # A tests/replays/-format fixture: L→R line cross at frame 3 (direction
+        # -1 = left-to-right; matches the golden directional fixture's setup).
+        def frame(i, x):
+            return {"t": i * 0.5, "tracks": [["t1", "person", [x, 0.45, 0.04, 0.08]]]}
+        fx = {
+            "camera_id": cam_id,
+            "rules": [{"type": "line_cross", "rule_id": "lc-e2e",
+                       "a": [0.5, 0.0], "b": [0.5, 1.0],
+                       "direction": -1, "labels": ["person"]}],
+            "frames": [frame(i, x) for i, x in
+                       enumerate([0.30, 0.38, 0.46, 0.55, 0.63])],
+            "expect": [{"rule_type": "line_cross", "rule_id": "lc-e2e",
+                        "at_frame": 3}],
+        }
+        import tempfile
+        from pathlib import Path as _P
+        fx_file = _P(tempfile.mkdtemp()) / "e2e_fixture.json"
+        fx_file.write_text(_json.dumps(fx))
+
+        page.goto(f"{server['base']}/#/cameras?id={cam_id}&tab=rules")
+        page.wait_for_selector("[data-role=verdict-card]")
+        # No fixture yet → the honest inline error, not a blank panel.
+        page.click("[data-role=verdict-card] button.primary")
+        page.wait_for_selector("[data-role=vt-error]")
+        assert "fixture" in page.inner_text("[data-role=vt-error]")
+
+        page.set_input_files("#vt-fixture", str(fx_file))
+        page.uncheck("#vt-draft")  # use the fixture's own rules
+        page.click("[data-role=verdict-card] button.primary")
+        page.wait_for_selector("[data-role=vt-banner]")
+        banner = page.inner_text("[data-role=vt-banner]")
+        assert "PASS" in banner, banner
+        assert page.locator(".vt-event").count() >= 1
+        # The SVG lane label names the rule the operator picked (SVG text →
+        # textContent, not inner_text).
+        assert page.locator(".vt-lane-label").first.text_content().startswith("line_cross/")
+
