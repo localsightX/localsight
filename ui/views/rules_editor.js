@@ -14,6 +14,7 @@ import { h, render, svgEl } from "../core/dom.js";
 import { api, can } from "../core/api.js";
 import { toast } from "../core/toast.js";
 import { navigate } from "../core/router.js";
+import { verdictTimelineCard } from "./verdict_timeline.js";
 
 const TYPES = [
   { id: "line_cross", label: "Line crossing", geometry: "line", needs: { a: true, b: true },
@@ -79,6 +80,15 @@ export function rulesEditor(body, cam) {
   // a read-only warning. Saving replaces them with the editor's list — the
   // operator sees exactly what that means before clicking Save.
   const legacy = cam.legacyRules ? JSON.stringify(cam.legacyRules) : null;
+
+  // Live draft access for the replay card — verify UNSAVED rules before save.
+  const getRules = () => rules;
+
+  // Replay & verdict card (R3.5): draft/fixture dry-run against the real
+  // engine. POST /api/rules/test enforces rules:configure, so the card only
+  // mounts for editors (a read-only render would just 403 on run).
+  const replayCard = can("rules:configure")
+    ? verdictTimelineCard(cam, getRules) : null;
 
   // ── shared canvas: snapshot + zone/line drawing ─────────────────────
   const statusEl = h("p", { class: "muted" }, editable
@@ -292,6 +302,7 @@ export function rulesEditor(body, cam) {
   renderRules();
   drawShapes();
   refreshExtras();
+  if (replayCard) body.append(replayCard);
 
   if (!editable) return;
 

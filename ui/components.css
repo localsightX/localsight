@@ -513,6 +513,14 @@ body.drawer-open { overflow: hidden; } /* lock scroll behind drawer */
 .tl-scrub.hidden { display: none; }
 .tl-interactive { cursor: pointer; }
 
+/* Verdict timeline (R3.5 replay tester) — geometry via SVG attrs only */
+.vt-grid { stroke: var(--border-2); stroke-width: 0.5; vector-effect: non-scaling-stroke; }
+.vt-lane-label { font-size: var(--text-xs); fill: var(--text-2); }
+.vt-fired { fill: var(--status-ok); fill-opacity: 0.9; }
+.vt-blocked { fill: var(--status-warn); fill-opacity: 0.5; }
+.vt-other { fill: var(--text-tertiary); fill-opacity: 0.25; }
+.vt-event { fill: var(--accent-text); stroke: var(--surface-0); stroke-width: 1; }
+
 @media (max-width: 720px) {
   .kv-grid { grid-template-columns: 1fr; }
   .drawer { width: 100vw; border-left: none; }
