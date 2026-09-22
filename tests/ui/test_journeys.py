@@ -5,6 +5,8 @@ outcome — not DOM internals. These encode the redesign's exit criteria:
 shareable investigations, honest live states, and management flows that
 expose every backend capability.
 """
+import contextlib
+
 import httpx
 import pytest
 
@@ -18,6 +20,30 @@ def _login_error(server, page, email, password):
     page.click("button[type=submit]")
     page.wait_for_timeout(700)
     return page.inner_text("#login-error")
+
+
+def _create_camera(server, admin_token, name):
+    """Create a camera via the API and return its id."""
+    r = httpx.post(f"{server['base']}/api/cameras",
+                   json={"name": name},
+                   headers={"Authorization": f"Bearer {admin_token}"}, timeout=10)
+    assert r.status_code == 200, r.text
+    return r.json()["id"]
+
+
+def _delete_camera(server, admin_token, cam_id):
+    """Best-effort cleanup: remove a camera created for a journey test.
+
+    Every camera-creating journey MUST delete its camera in a finally block —
+    the visual-regression states (cameras-grid among them) run in the SAME
+    server/DB session, and an extra card in the grid drifts the committed
+    baseline (this exact pollution pushed cameras-grid over its 3.0 budget in
+    CI). Deleting is idempotent; a cleanup failure must not mask the test's
+    own assertion, hence the suppress.
+    """
+    with contextlib.suppress(Exception):
+        httpx.delete(f"{server['base']}/api/cameras/{cam_id}",
+                     headers={"Authorization": f"Bearer {admin_token}"}, timeout=10)
 
 
 class TestLoginJourney:
@@ -146,46 +172,45 @@ class TestCameraRemovalJourney:
     def test_remove_camera_typed_confirm(self, server, logged_in, admin_token):
         """Removing a camera is a typed-confirm gate; the grid then loses the card."""
         page = logged_in
-        r = httpx.post(f"{server['base']}/api/cameras",
-                       json={"name": "e2e-remove-me"},
-                       headers={"Authorization": f"Bearer {admin_token}"}, timeout=10)
-        assert r.status_code == 200, r.text
-        cam_id = r.json()["id"]
-
-        page.goto(f"{server['base']}/#/cameras?id={cam_id}")
-        page.wait_for_selector("[data-role=remove-camera]")
-        # The destructive control is not even revealed until asked for…
-        page.click("[data-act=remove-camera]")
-        page.wait_for_selector("[data-role=remove-confirm]:not(.hidden)")
-        # …and it stays locked until the camera's exact name is typed.
-        assert page.is_disabled("[data-act=remove-camera-confirm]")
-        page.fill("[data-field=confirm-name]", "e2e-remove")
-        assert page.is_disabled("[data-act=remove-camera-confirm]")
-        page.fill("[data-field=confirm-name]", "e2e-remove-me")
-        page.wait_for_selector("[data-act=remove-camera-confirm]:not([disabled])")
-        page.click("[data-act=remove-camera-confirm]")
-        page.wait_for_selector(".cam-grid")
-        assert page.locator(".cam-card[data-cam='e2e-remove-me']").count() == 0
+        cam_id = _create_camera(server, admin_token, "e2e-remove-me")
+        try:
+            page.goto(f"{server['base']}/#/cameras?id={cam_id}")
+            page.wait_for_selector("[data-role=remove-camera]")
+            # The destructive control is not even revealed until asked for…
+            page.click("[data-act=remove-camera]")
+            page.wait_for_selector("[data-role=remove-confirm]:not(.hidden)")
+            # …and it stays locked until the camera's exact name is typed.
+            assert page.is_disabled("[data-act=remove-camera-confirm]")
+            page.fill("[data-field=confirm-name]", "e2e-remove")
+            assert page.is_disabled("[data-act=remove-camera-confirm]")
+            page.fill("[data-field=confirm-name]", "e2e-remove-me")
+            page.wait_for_selector("[data-act=remove-camera-confirm]:not([disabled])")
+            page.click("[data-act=remove-camera-confirm]")
+            page.wait_for_selector(".cam-grid")
+            assert page.locator(".cam-card[data-cam='e2e-remove-me']").count() == 0
+        finally:
+            # The UI delete already removed it; this is the failure-path net.
+            _delete_camera(server, admin_token, cam_id)
 
     def test_remove_camera_cancel_keeps_it(self, server, logged_in, admin_token):
         """Cancel backs out without any API call — the camera survives."""
         page = logged_in
-        r = httpx.post(f"{server['base']}/api/cameras",
-                       json={"name": "e2e-keep-me"},
-                       headers={"Authorization": f"Bearer {admin_token}"}, timeout=10)
-        assert r.status_code == 200, r.text
-        cam_id = r.json()["id"]
-
-        page.goto(f"{server['base']}/#/cameras?id={cam_id}")
-        page.wait_for_selector("[data-role=remove-camera]")
-        page.click("[data-act=remove-camera]")
-        page.wait_for_selector("[data-role=remove-confirm]:not(.hidden)")
-        page.click("[data-act=remove-camera-cancel]")
-        # 'hidden' means display:none — wait for attachment, not visibility.
-        page.wait_for_selector("[data-role=remove-confirm].hidden", state="attached")
-        page.click("#nav button[data-view='cameras']")
-        page.wait_for_selector(".cam-grid")
-        assert page.locator(".cam-card[data-cam='e2e-keep-me']").count() == 1
+        cam_id = _create_camera(server, admin_token, "e2e-keep-me")
+        try:
+            page.goto(f"{server['base']}/#/cameras?id={cam_id}")
+            page.wait_for_selector("[data-role=remove-camera]")
+            page.click("[data-act=remove-camera]")
+            page.wait_for_selector("[data-role=remove-confirm]:not(.hidden)")
+            page.click("[data-act=remove-camera-cancel]")
+            # 'hidden' means display:none — wait for attachment, not visibility.
+            page.wait_for_selector("[data-role=remove-confirm].hidden", state="attached")
+            page.click("#nav button[data-view='cameras']")
+            page.wait_for_selector(".cam-grid")
+            assert page.locator(".cam-card[data-cam='e2e-keep-me']").count() == 1
+        finally:
+            # The test asserts the camera SURVIVES the cancel — but it must not
+            # survive the SUITE: the grid baseline expects only seeded cards.
+            _delete_camera(server, admin_token, cam_id)
 
 
 class TestVerdictTimelineJourney:
@@ -194,46 +219,44 @@ class TestVerdictTimelineJourney:
         card, run it, and the golden-replay banner + SVG fire markers render."""
         import json as _json
         page = logged_in
-        r = httpx.post(f"{server['base']}/api/cameras",
-                       json={"name": "e2e-verdict-cam"},
-                       headers={"Authorization": f"Bearer {admin_token}"}, timeout=10)
-        assert r.status_code == 200, r.text
-        cam_id = r.json()["id"]
+        cam_id = _create_camera(server, admin_token, "e2e-verdict-cam")
+        try:
+            # A tests/replays/-format fixture: L→R line cross at frame 3 (direction
+            # -1 = left-to-right; matches the golden directional fixture's setup).
+            def frame(i, x):
+                return {"t": i * 0.5, "tracks": [["t1", "person", [x, 0.45, 0.04, 0.08]]]}
+            fx = {
+                "camera_id": cam_id,
+                "rules": [{"type": "line_cross", "rule_id": "lc-e2e",
+                           "a": [0.5, 0.0], "b": [0.5, 1.0],
+                           "direction": -1, "labels": ["person"]}],
+                "frames": [frame(i, x) for i, x in
+                           enumerate([0.30, 0.38, 0.46, 0.55, 0.63])],
+                "expect": [{"rule_type": "line_cross", "rule_id": "lc-e2e",
+                            "at_frame": 3}],
+            }
+            import tempfile
+            from pathlib import Path as _P
+            fx_file = _P(tempfile.mkdtemp()) / "e2e_fixture.json"
+            fx_file.write_text(_json.dumps(fx))
 
-        # A tests/replays/-format fixture: L→R line cross at frame 3 (direction
-        # -1 = left-to-right; matches the golden directional fixture's setup).
-        def frame(i, x):
-            return {"t": i * 0.5, "tracks": [["t1", "person", [x, 0.45, 0.04, 0.08]]]}
-        fx = {
-            "camera_id": cam_id,
-            "rules": [{"type": "line_cross", "rule_id": "lc-e2e",
-                       "a": [0.5, 0.0], "b": [0.5, 1.0],
-                       "direction": -1, "labels": ["person"]}],
-            "frames": [frame(i, x) for i, x in
-                       enumerate([0.30, 0.38, 0.46, 0.55, 0.63])],
-            "expect": [{"rule_type": "line_cross", "rule_id": "lc-e2e",
-                        "at_frame": 3}],
-        }
-        import tempfile
-        from pathlib import Path as _P
-        fx_file = _P(tempfile.mkdtemp()) / "e2e_fixture.json"
-        fx_file.write_text(_json.dumps(fx))
+            page.goto(f"{server['base']}/#/cameras?id={cam_id}&tab=rules")
+            page.wait_for_selector("[data-role=verdict-card]")
+            # No fixture yet → the honest inline error, not a blank panel.
+            page.click("[data-role=verdict-card] button.primary")
+            page.wait_for_selector("[data-role=vt-error]")
+            assert "fixture" in page.inner_text("[data-role=vt-error]")
 
-        page.goto(f"{server['base']}/#/cameras?id={cam_id}&tab=rules")
-        page.wait_for_selector("[data-role=verdict-card]")
-        # No fixture yet → the honest inline error, not a blank panel.
-        page.click("[data-role=verdict-card] button.primary")
-        page.wait_for_selector("[data-role=vt-error]")
-        assert "fixture" in page.inner_text("[data-role=vt-error]")
-
-        page.set_input_files("#vt-fixture", str(fx_file))
-        page.uncheck("#vt-draft")  # use the fixture's own rules
-        page.click("[data-role=verdict-card] button.primary")
-        page.wait_for_selector("[data-role=vt-banner]")
-        banner = page.inner_text("[data-role=vt-banner]")
-        assert "PASS" in banner, banner
-        assert page.locator(".vt-event").count() >= 1
-        # The SVG lane label names the rule the operator picked (SVG text →
-        # textContent, not inner_text).
-        assert page.locator(".vt-lane-label").first.text_content().startswith("line_cross/")
+            page.set_input_files("#vt-fixture", str(fx_file))
+            page.uncheck("#vt-draft")  # use the fixture's own rules
+            page.click("[data-role=verdict-card] button.primary")
+            page.wait_for_selector("[data-role=vt-banner]")
+            banner = page.inner_text("[data-role=vt-banner]")
+            assert "PASS" in banner, banner
+            assert page.locator(".vt-event").count() >= 1
+            # The SVG lane label names the rule the operator picked (SVG text →
+            # textContent, not inner_text).
+            assert page.locator(".vt-lane-label").first.text_content().startswith("line_cross/")
+        finally:
+            _delete_camera(server, admin_token, cam_id)
 
