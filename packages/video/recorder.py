@@ -108,7 +108,14 @@ class Recorder:
             allowlist=self._allowlist,
         )
         seg_start = segment_boundary(start, self.seg_seconds)
-        key = segment_key(self.camera_id, seg_start)
+        # The key must align to the SAME boundary the segment is cut on. Passing
+        # seg_seconds matters whenever it is not the 300 s default: the rig cuts
+        # 30 s segments, and with the default bucket every segment inside a
+        # 5-minute window shared one key, so each finalize overwrote the
+        # previous clip on disk while its VideoSegment row kept pointing at the
+        # (now foreign) file — playback served the wrong 30 s for 9 of 10
+        # segments and size_bytes stopped matching the bytes on disk.
+        key = segment_key(self.camera_id, seg_start, seg_seconds=self.seg_seconds)
         args = self._build_args(url, seg_start)
         try:
             proc = self._spawn(args)
