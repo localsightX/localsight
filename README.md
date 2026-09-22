@@ -115,7 +115,7 @@ operator-side staging path any production model takes.
 pip install -r requirements.txt
 pip install pytest pytest-cov httpx numpy
 rm -f test_localsight.db
-pytest -q                       # 187 tests: auth, RBAC, SSRF, encryption, analytics, pipeline, API, live, alerts, forensic search, ONNX detector, perf gates, review regressions
+pytest -q                       # 274 tests: auth, RBAC, SSRF, encryption, analytics, pipeline, API, live, alerts, forensic search, ONNX detector, perf gates, review regressions, rule grammar + replay tester + alert budgets
 ```
 
 Coverage report: `pytest --cov=packages --cov=apps --cov-fail-under=50` (currently 78%).
@@ -130,7 +130,7 @@ detection write-gating, and live-stream stop/reap.
 Every push to `main` and every PR runs a 10-job GitHub Actions pipeline:
 
 - **lint** — ruff + mypy
-- **unit tests** — pytest against SQLite (187 tests, ~60s)
+- **unit tests** — pytest against SQLite (274 tests, ~60s)
 - **integration** — pytest against PostgreSQL + pgvector
 - **dependency audit** — pip-audit (OSV/PyPI) + Safety (pyup.io)
 - **CodeQL SAST** — GitHub code scanning for Python
@@ -309,7 +309,7 @@ infrastructure/  docker, compose, nginx, monitoring
 docs/             architecture, security, operations, integrations, api
 scripts/          gen_env.py, capacity.py
 ui/               static dashboard (served at /)
-tests/            unit + security + integration (187 tests)
+tests/            unit + security + integration (274 tests)
 ```
 
 ## Status
@@ -320,7 +320,7 @@ media URLs, path-traversal-safe storage, event aggregation, pluggable AI pipelin
 **multi-class detector backends (ONNX/TensorRT/OpenVINO/TFLite) + reference fallback**,
 **SORT-style tracker**, **behavior rule engine**, **ANPR pipeline (encrypted plates)**,
 **continuous main-stream recording**, **LL-HLS live view**, **webhook/email/push alerts
-with DB routing**, **analytics/BI endpoints**, **VLM semantic search endpoint**, camera/NVR
+with DB routing + per-camera daily alert budgets**, **analytics/BI endpoints**, **VLM semantic search endpoint**, camera/NVR
 management (TP-Link + ONVIF discovery + multi-vendor presets), persons/enrollment, events
 search, timeline, capacity model, Docker Compose, and a runnable dashboard.
 
