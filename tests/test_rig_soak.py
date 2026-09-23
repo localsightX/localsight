@@ -10,6 +10,7 @@ must FAIL a quiet budget, never pass it).
 """
 from __future__ import annotations
 
+import datetime as dt
 import importlib.util
 import json
 import os
@@ -239,6 +240,20 @@ def test_rig_mode_marker_round_trips_and_defaults_to_local(tmp_path, monkeypatch
     assert _RIG.rig_mode() == "local"   # no marker yet → pre-existing rigs
     _RIG._write_mode("external")
     assert _RIG.rig_mode() == "external"
+
+
+def test_verify_date_uses_the_utc_day_not_local():
+    """Regression: cmd_verify built the timeline query date with time.strftime
+    (local time), but /api/timeline filters by UTC day. On a UTC+4 box at 22:48
+    UTC the local calendar day had already rolled to 09-23 while every segment
+    still landed on UTC 09-22, so the probe queried an empty day and reported
+    "recording segment persisted" as a spurious FAIL.
+    """
+    utc_plus_4 = dt.timezone(dt.timedelta(hours=4))
+    assert _RIG._verify_date(dt.datetime(2026, 9, 23, 2, 48, tzinfo=utc_plus_4)) == "2026-09-22"
+    assert _RIG._verify_date(dt.datetime(2026, 9, 22, 22, 48, tzinfo=dt.UTC)) == "2026-09-22"
+    # The reported day only ever rolls at the UTC midnight boundary.
+    assert _RIG._verify_date(dt.datetime(2026, 9, 23, 0, 0, tzinfo=dt.UTC)) == "2026-09-23"
 
 
 if __name__ == "__main__":

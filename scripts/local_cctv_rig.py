@@ -681,6 +681,19 @@ def cmd_status() -> None:
             print(f"  (camera status unavailable: {exc})")
 
 
+def _verify_date(now: dt.datetime) -> str:
+    """The UTC day the timeline endpoint filters on.
+
+    ``GET /api/timeline`` documents its ``date`` as "UTC date YYYY-MM-DD", so the
+    verify probe must ask for the current *UTC* date. Building it with
+    ``time.strftime`` (local time) made the probe query tomorrow's empty day and
+    report "recording segment persisted" as a spurious FAIL whenever the local
+    calendar day had rolled over but the UTC day had not (UTC+4: 20:00-24:00
+    UTC) — the exact window an operator pre-flights the rig before a soak.
+    """
+    return now.astimezone(dt.UTC).strftime("%Y-%m-%d")
+
+
 def cmd_verify() -> int:
     base = f"http://127.0.0.1:{API_PORT}"
     checks: list[tuple[str, bool, str]] = []
@@ -733,7 +746,7 @@ def cmd_verify() -> int:
     seg_count = 0
     while time.monotonic() < deadline:
         st, tl = http_json("GET",
-                           f"/api/timeline?date={time.strftime('%Y-%m-%d')}&camera_id={cam_id}",
+                           f"/api/timeline?date={_verify_date(_utc_now())}&camera_id={cam_id}",
                            base, token)
         seg_count = len(tl.get("recording", []))
         if seg_count > 0:
