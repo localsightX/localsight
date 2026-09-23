@@ -112,6 +112,17 @@ curl "http://localhost:8000/api/search/plates?q=ab-12%20cd" \
 # stored, returned, or searched. Partial plates are not searchable by design.
 ```
 
+### Gate-access lanes (R4.1 — in development)
+
+The lane schema has landed — `Lane` and `LaneWhitelistEntry` tables plus
+`cameras.pipeline_flags` (see [`docs/architecture/erd.md`](../architecture/erd.md))
+— but the endpoints are not shipped yet. Planned surface: lane CRUD and whitelist
+enrollment behind `lanes:manage` / `lanes:view`, barrier destinations validated with
+the same SSRF guard as alert routes, and every whitelist row stored as a `plate_hash`
+HMAC token — the identical token `GET /api/search/plates` matches — so enrollment and
+sighting share one index and plaintext plates never reach the DB. Until the endpoints
+ship, `lane_access` stays off by default and nothing can trigger a barrier.
+
 ### Use case: Save a forensic search for the team shift (audited)
 ```bash
 curl -X POST http://localhost:8000/api/searches \
