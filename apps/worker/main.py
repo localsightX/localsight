@@ -33,17 +33,34 @@ from packages.ai.rules import rule_engine_from_json
 from packages.ai.tracker import IouTracker
 from packages.domain import timeutil
 from packages.domain.alertcount import count_alerts_today
+from packages.domain.lane import (
+    DECISION_BARRIER_UNAVAILABLE,
+    DECISION_GRANTED,
+    GateDecision,
+    decide_gate_access,
+    pipeline_flag_enabled,
+)
 from packages.domain.models import (
+    PIPELINE_FLAG_LANE_ACCESS,
     AlertRoute,
     AuditLog,
     Camera,
     Event,
+    Lane,
+    LaneWhitelistEntry,
     PersonEmbedding,
     RefreshToken,
     Snapshot,
     VideoSegment,
 )
-from packages.notify import Alert, PushNotifier, WebhookNotifier, build_notifier, dispatch
+from packages.notify import (
+    Alert,
+    Notifier,
+    PushNotifier,
+    WebhookNotifier,
+    build_notifier,
+    dispatch,
+)
 from packages.notify.budget import DailyAlertBudget
 from packages.observability import disk
 from packages.observability.logging import configure_logging, logging
@@ -484,6 +501,231 @@ def _safe_alert_detail(detail: dict | None) -> dict:
     return {k: detail[k] for k in _ALERT_DETAIL_KEYS if k in detail}
 
 
+# ── gate access (R4.1): plate read → whitelist join → window → barrier ────────
+#
+# A camera whose `pipeline_flags.lane_access` is on is treated as an access-
+# control point: each plate the ANPR stage reads is matched against the lane's
+# keyed-HMAC whitelist and, only on a match inside the allow window, exactly one
+# barrier OPEN command is issued. Deny-by-default (packages.domain.lane.
+# decide_gate_access): a miss / outside-window / disabled lane is recorded as an
+# event and NEVER reaches the relay. The barrier is a privileged side effect —
+# its destination is envelope-encrypted at rest and re-validated against the SSRF
+# policy at send time, and its payload is filtered to the third-party-safe detail
+# keys so plate material (ciphertext or digest) never leaves the host.
+
+
+class GateCooldown:
+    """Per-(lane, plate) barrier command idempotency.
+
+    A lane's ``cooldown_sec`` suppresses a second OPEN for the same plate inside
+    the window: one command per vehicle passage, not one per re-read of the same
+    plate (ANPR re-reads on a throttle). Event timestamps — not wall-clock time
+    — drive the window, so suppression is deterministic under a replay/test feed
+    and unaffected by a stall in the frame loop.
+    """
+
+    def __init__(self) -> None:
+        self._last: dict[tuple[str, str], dt.datetime] = {}
+
+    def is_suppressed(self, key: tuple[str, str], ts: dt.datetime, cooldown_sec: int) -> bool:
+        if cooldown_sec <= 0:
+            return False
+        last = self._last.get(key)
+        return last is not None and (ts - last).total_seconds() < cooldown_sec
+
+    def record(self, key: tuple[str, str], ts: dt.datetime) -> None:
+        self._last[key] = ts
+
+
+_gate_cooldown = GateCooldown()
+
+
+def _build_barrier_notifier(channel: str, cfg: dict, allowlist: list[str]) -> Notifier | None:
+    """Construct the relay notifier for a barrier command.
+
+    Returns None when the channel cannot be used — the caller treats that as a
+    missed open rather than letting a config error open the gate. Webhook
+    destinations are re-validated against the SSRF policy here, at send time:
+    create-time validation is not trusted on the hot path (mirrors
+    _build_notifiers), so a destination re-pointed at an internal address after
+    creation still cannot be dialled.
+    """
+    if channel == "webhook":
+        url = (cfg.get("url") or "").strip()
+        if not url:
+            log.warning("barrier webhook has no url — OPEN suppressed")
+            return None
+        try:
+            validate_egress_url(url, allowlist=allowlist)
+        except UnsafeUrlError:
+            log.warning("barrier webhook failed SSRF re-validation — OPEN suppressed")
+            return None
+        return WebhookNotifier(url)
+    try:
+        return build_notifier(channel, cfg)
+    except Exception as exc:
+        log.warning("%s barrier channel is unusable: %s", channel, exc)
+        return None
+
+
+def _send_barrier_command(rt, lane: Lane, camera: Camera, ev: Event, detail: dict, *,
+                          build=_build_barrier_notifier) -> bool:
+    """Dispatch one barrier OPEN command to the lane's relay channel.
+
+    Returns True only when a notifier was actually invoked. The relay
+    destination is envelope-encrypted in ``barrier_config_enc`` (exactly like
+    alert_routes.config_enc) and decrypted here — the KEK never leaves the host.
+    The payload carries only third-party-safe keys: plate_enc (ciphertext) and
+    plate_hash (a plate-derived digest) never reach a relay.
+
+    ``build`` is injectable so the dispatch is testable offline.
+    """
+    if not lane.barrier_config_enc:
+        log.warning("lane %s has no barrier config — OPEN suppressed (gate stays closed)", lane.id)
+        return False
+    try:
+        cfg = rt.crypto.decrypt_json(lane.barrier_config_enc)
+    except Exception as exc:
+        log.warning("lane %s barrier config is undecryptable: %s", lane.id, exc)
+        return False
+    channel = lane.barrier_channel or "webhook"
+    notifier = build(channel, cfg, rt.settings.ssrf_allowlist_cidrs)
+    if notifier is None:
+        return False
+    dispatch(
+        Alert(
+            rule_id=ev.track_id or "gate",
+            rule_type="gate_open",
+            camera_id=camera.id,
+            severity="info",
+            title=f"barrier open · {lane.name or camera.name}",
+            message=f"whitelisted plate read on lane '{lane.name or camera.name}'",
+            detail=detail,
+            ts=timeutil.iso(ev.timestamp_start) if ev.timestamp_start else None,
+        ),
+        [notifier],
+    )
+    return True
+
+
+def _record_gate_outcome(session, camera: Camera, lane: Lane, ev: Event, plate_hash: str, *,
+                         event_type: str, reason: str, granted: bool,
+                         label: str | None = None) -> None:
+    """Persist a gate decision as an Event row (forensic trail / events API) and
+    an AuditLog row. R4.1 acceptance: every open/close is audited with the plate
+    HASH — never the plaintext plate — and the operator who armed the lane."""
+    session.add(Event(
+        camera_id=camera.id,
+        track_id=ev.track_id,
+        identity_status="unknown",
+        event_type=event_type,
+        timestamp_start=ev.timestamp_start,
+        timestamp_end=ev.timestamp_end,
+        confidence=ev.confidence,
+        bbox=ev.bbox or {},
+        detail={
+            "lane_id": lane.id,
+            "lane": lane.name,
+            "reason": reason,
+            "entry_label": label,
+            # Keyed digest only — plaintext plates are never stored (R2 index).
+            "plate_hash": plate_hash,
+        },
+    ))
+    session.add(AuditLog(
+        username=lane.armed_by or "system",
+        action=event_type,
+        resource=f"lanes/{lane.id}",
+        result="success" if granted else "failure",
+        detail={
+            "camera_id": camera.id,
+            "lane": lane.name,
+            "reason": reason,
+            "plate_hash": plate_hash,
+        },
+    ))
+
+
+def evaluate_lane_access(session, rt, camera: Camera, anpr_events,
+                         *, now: dt.datetime | None = None,
+                         send_barrier=_send_barrier_command,
+                         cooldown: GateCooldown | None = None) -> list[GateDecision]:
+    """Decide gate access for the ANPR plate reads of one frame (R4.1).
+
+    Off unless the camera's ``pipeline_flags.lane_access`` is explicitly on, and
+    a no-op when the camera has no lane at all — a stock camera costs one flag
+    lookup. For each plate hash the whitelist is joined on the exact keyed-HMAC
+    token the ANPR stage wrote to ``Event.detail``, the allow window is
+    evaluated, and on a grant exactly one barrier OPEN is dispatched (subject to
+    the lane cooldown); a denied read is logged and never reaches the relay.
+
+    ``send_barrier`` is injectable so the whole path is testable offline, the
+    same way ``enqueue_analytic_alerts`` takes ``put``. Returns every decision
+    evaluated this frame (cooldown-suppressed repeats included).
+    """
+    if not pipeline_flag_enabled(camera.pipeline_flags, PIPELINE_FLAG_LANE_ACCESS):
+        return []
+    # Load the lane even when disarmed: a disabled lane still produces a
+    # recorded denial (operator-visible), only a camera with no lane at all is
+    # a silent no-op — nothing is configured to evaluate.
+    lane = session.query(Lane).filter_by(camera_id=camera.id).first()
+    if lane is None:
+        return []
+    cd = cooldown if cooldown is not None else _gate_cooldown
+    now_utc = now if now is not None else timeutil.utcnow()
+    decisions: list[GateDecision] = []
+    for ev in anpr_events:
+        detail = ev.detail if isinstance(ev.detail, dict) else {}
+        plate_hash = detail.get("plate_hash")
+        if not plate_hash:
+            continue
+        entry = (
+            session.query(LaneWhitelistEntry)
+            .filter_by(lane_id=lane.id, plate_hash=plate_hash, enabled=True)
+            .first()
+        )
+        decision = decide_gate_access(lane, plate_hash, entry, now_utc,
+                                      default_tz=camera.timezone or "UTC")
+        ts = ev.timestamp_start or now_utc
+        if decision.granted:
+            key = (lane.id, plate_hash)
+            if cd.is_suppressed(key, ts, lane.cooldown_sec):
+                metrics.inc("gate_commands_suppressed_total", labels=f'lane="{lane.id}"')
+                log.debug("barrier OPEN for lane %s suppressed by cooldown", lane.id)
+                decisions.append(decision)
+                continue
+            sent = send_barrier(rt, lane, camera, ev, {
+                "command": "open",
+                "lane": lane.name,
+                "reason": decision.reason,
+                **_safe_alert_detail(ev.detail),
+            })
+            if not sent:
+                # Policy said open but the relay could not be commanded: record
+                # it rather than dropping the read silently, and do NOT consume
+                # the cooldown so the next read of the plate can retry.
+                _record_gate_outcome(session, camera, lane, ev, plate_hash,
+                                     event_type="gate_open", granted=False,
+                                     reason=DECISION_BARRIER_UNAVAILABLE,
+                                     label=decision.entry_label)
+                metrics.inc("gate_opens_failed_total", labels=f'lane="{lane.id}"')
+                decisions.append(decision)
+                continue
+            cd.record(key, ts)
+            _record_gate_outcome(session, camera, lane, ev, plate_hash,
+                                 event_type="gate_open", granted=True,
+                                 reason=DECISION_GRANTED, label=decision.entry_label)
+            metrics.inc("gate_opens_total", labels=f'lane="{lane.id}"')
+        else:
+            _record_gate_outcome(session, camera, lane, ev, plate_hash,
+                                 event_type="gate_deny", granted=False,
+                                 reason=decision.reason, label=decision.entry_label)
+            metrics.inc("gate_denies_total",
+                        labels=f'lane="{lane.id}" reason="{decision.reason}"')
+        decisions.append(decision)
+    return decisions
+
+
 def persist_camera_status(rt, cid: str, st: str) -> None:
     """Persist a gateway state transition to Camera.status/health/last_seen.
 
@@ -677,6 +919,21 @@ def run_camera(rt, camera: Camera, stop: threading.Event) -> None:
                             labels=f'camera="{camera.id}"')
             for ev in events:
                 log.info("event %s cam=%s identity=%s", ev.id, ev.camera_id, ev.identity_status)
+            # R4.1 gate access: plate reads on a lane camera decide barrier open
+            # vs deny. Off unless pipeline_flags.lane_access is set and a no-op
+            # without an enabled lane, so a stock camera costs one flag lookup.
+            # Evaluated in its own try: a barrier failure must never drop the
+            # frame or starve the alert path below (the ANPR evidence is already
+            # committed).
+            anpr_events = [e for e in getattr(pipeline, "_last_analytic", [])
+                           if e.event_type == "anpr"]
+            if anpr_events:
+                try:
+                    evaluate_lane_access(session, rt, camera, anpr_events)
+                    session.commit()
+                except Exception:
+                    session.rollback()
+                    log.exception("gate access evaluation failed for camera %s", camera.id)
             # Fan out point-in-time analytic events to alert channels (R3.6: the
             # per-camera daily budget gates notifications; evidence is stored
             # regardless). Detail is filtered to the third-party-safe keys (no

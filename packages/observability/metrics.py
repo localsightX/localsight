@@ -34,6 +34,10 @@ class Metrics:
         "pipeline_latency_ms": "Per-frame pipeline processing latency in ms",
         "analytic_events_total": "Point-in-time analytic events (rules/ANPR)",
         "camera_status": "1 when camera gateway reports STREAMING, else 0",
+        "gate_opens_total": "R4.1 barrier OPEN commands actually dispatched",
+        "gate_opens_failed_total": "R4.1 granted opens that could not reach the relay",
+        "gate_denies_total": "R4.1 plate reads denied (by reason)",
+        "gate_commands_suppressed_total": "R4.1 OPENs suppressed by the per-plate cooldown",
     }
 
     def __init__(self) -> None:

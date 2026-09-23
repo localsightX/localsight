@@ -14,7 +14,12 @@ Kept pure and unit-tested like packages.domain.events. Two responsibilities:
 from __future__ import annotations
 
 import datetime as dt
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+if TYPE_CHECKING:
+    from packages.domain.models import Lane, LaneWhitelistEntry
 
 
 def pipeline_flag_enabled(flags: dict | None, name: str) -> bool:
@@ -79,3 +84,77 @@ def _parse_hhmm(value: object) -> dt.time:
         except ValueError:
             continue
     raise ValueError(f"expected HH:MM, got {value!r}")
+
+
+# ── gate-access decision (R4.1) ───────────────────────────────────────────────
+#
+# The deny-by-default decision for one plate read on a lane camera. Pure: takes
+# the lane and the whitelist row matched by the exact keyed-HMAC plate token, no
+# session or network. The worker drives it (packages → apps stays one-way) and
+# the reasons double as the audit detail + Prometheus labels, so a denial is
+# always explainable to the operator who armed the lane.
+
+DECISION_GRANTED = "granted"
+DECISION_LANE_DISABLED = "lane_disabled"
+DECISION_NOT_WHITELISTED = "not_whitelisted"
+DECISION_OUTSIDE_WINDOW = "outside_window"
+# Policy granted the open but the relay itself could not be commanded (missing
+# or undecryptable barrier config, an SSRF-rejected destination, an unusable
+# channel). Reported on a gate_open row with granted=False so a missed open is
+# visible instead of silently dropped; the worker deliberately does NOT consume
+# the cooldown, so the next read of the plate can retry the relay.
+DECISION_BARRIER_UNAVAILABLE = "barrier_unavailable"
+
+
+@dataclass(frozen=True)
+class GateDecision:
+    """The outcome of matching one plate read against a lane policy.
+
+    ``reason`` is one of the DECISION_* constants — a granted decision is
+    always ``DECISION_GRANTED``; every other reason denies and the barrier
+    must stay closed. ``entry_label`` is the operator note on the matched
+    whitelist row (never the plaintext plate) for audit context.
+    """
+
+    granted: bool
+    reason: str
+    lane_id: str
+    camera_id: str
+    plate_hash: str
+    entry_label: str | None = None
+
+
+def decide_gate_access(
+    lane: Lane,
+    plate_hash: str,
+    entry: LaneWhitelistEntry | None,
+    now_utc: dt.datetime,
+    *,
+    default_tz: str = "UTC",
+) -> GateDecision:
+    """Evaluate the R4.1 gate decision for one plate read.
+
+    Deny-by-default, evaluated in the strictest-first order so no later, weaker
+    check can resurrect an earlier deny:
+
+    1. the lane must be ``enabled`` (an operator disarming a lane must stop
+       access immediately, even though the whitelist rows still exist);
+    2. a matching, enabled whitelist row must exist — a plate that is not
+       enrolled is denied and only ever logged;
+    3. the read must fall inside the allow window. A per-plate ``allow_window``
+       overrides the lane window when set (a delivery pass valid 09:00-13:00 on
+       an otherwise 24/7 lane); either being malformed denies — fail closed.
+
+    ``now_utc`` is the event timestamp (the pipeline already has it).
+    ``default_tz`` is the lane camera's timezone, applied when a window does
+    not name its own — pass ``camera.timezone`` from the worker.
+    """
+    if not lane.enabled:
+        return GateDecision(False, DECISION_LANE_DISABLED, lane.id, lane.camera_id, plate_hash)
+    if entry is None or not entry.enabled:
+        return GateDecision(False, DECISION_NOT_WHITELISTED, lane.id, lane.camera_id, plate_hash)
+    window = entry.allow_window if entry.allow_window is not None else lane.allow_window
+    if not is_within_window(now_utc, window, default_tz):
+        return GateDecision(False, DECISION_OUTSIDE_WINDOW, lane.id, lane.camera_id,
+                            plate_hash, entry.label)
+    return GateDecision(True, DECISION_GRANTED, lane.id, lane.camera_id, plate_hash, entry.label)
