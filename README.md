@@ -42,7 +42,7 @@ screen) and the [product tour on the project site](https://localsightx.github.io
 | Tracking | ✅ production | SORT-style motion-prediction tracker for stable IDs; appearance ReID needs a staged embedding model |
 | Behavior analytics (rules) | ✅ production | Line-cross, intrusion, loitering, object-left/removed, crowd — per-camera JSON |
 | ANPR / LPR | ✅ pipeline; ⚙️ model-dependent | Cropped + throttled + deduped; plate values encrypted at rest. Real OCR needs a staged plate detector+OCR model |
-| Gate access / LPR lanes (R4.1) | 🧱 in development | `Lane` (1:1 with a camera) + keyed-HMAC `plate_hash` whitelist + allow-window schedule + barrier relay; off unless `pipeline_flags.lane_access` is set |
+| Gate access / LPR lanes (R4.1) | ✅ pipeline | Camera-as-lane: keyed-HMAC `plate_hash` whitelist + allow-window schedule + webhook/MQTT barrier relay, deny by default. Lane CRUD + plate enrollment API (`lanes:manage` / `lanes:view`); off unless `pipeline_flags.lane_access` is set |
 | Continuous recording | ✅ production | Main-stream segmented MP4 → StorageProvider; `VideoSegment` rows; requires FFmpeg |
 | Live view | ✅ production | Authorized LL-HLS gateway (ffmpeg transcode of substream); requires FFmpeg |
 | Alerts | ✅ production | Webhook / email / MQTT / push routed per rule_type+camera via `AlertRoute`; per-route cooldown to prevent alert storms; webhook URLs SSRF-validated |
@@ -53,10 +53,6 @@ screen) and the [product tour on the project site](https://localsightx.github.io
 ⚙️ = works out of the box with a deterministic **reference** implementation; swap in a
 staged model via the `ModelRegistry` for production accuracy. There are no insecure
 defaults and no network calls to third parties.
-
-🧱 = the data model is landed (`Lane`, `LaneWhitelistEntry`, `cameras.pipeline_flags`
-— see [`docs/architecture/erd.md`](docs/architecture/erd.md)); the barrier action,
-lane API and worker gating are in development, so nothing opens a gate yet.
 
 ## Quick start (local, zero infra)
 

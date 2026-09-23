@@ -86,6 +86,52 @@ def _parse_hhmm(value: object) -> dt.time:
     raise ValueError(f"expected HH:MM, got {value!r}")
 
 
+def validate_window(window: dict | None) -> None:
+    """Structural check for a lane / whitelist allow-window.
+
+    Raises ``ValueError`` (message safe to return to an operator) when a window
+    is malformed; returns silently when it is well-formed or ``None``.
+
+    The write path (the lane API) REJECTS a malformed window instead of
+    persisting it. ``is_within_window`` fails closed at read time, so a window
+    that merely *looks* right would deny every read silently — an operator
+    could arm a lane that never opens and have no signal why. Failing the write
+    names the problem at configure time instead. Read-time fail-closed stays
+    the authority for rows already stored (and for hand-edited DB rows).
+    """
+    if window is None:
+        return
+    if not isinstance(window, dict):
+        raise ValueError("allow_window must be an object")
+    try:
+        _parse_hhmm(window["start"])
+        _parse_hhmm(window["end"])
+    except KeyError as exc:
+        raise ValueError("allow_window requires 'start' and 'end' as HH:MM") from exc
+    except ValueError as exc:
+        raise ValueError(f"allow_window start/end: {exc}") from exc
+    tz = window.get("tz")
+    if tz is not None:
+        if not isinstance(tz, str):
+            raise ValueError("allow_window 'tz' must be an IANA name string")
+        try:
+            ZoneInfo(tz)
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            raise ValueError(f"allow_window 'tz' is not a known timezone: {tz!r}") from exc
+    days = window.get("days")
+    if days is not None:
+        if not isinstance(days, list) or not days:
+            raise ValueError(
+                "allow_window 'days' must be a non-empty list of weekday ints (1=Mon..7=Sun)"
+            )
+        try:
+            parsed = [int(d) for d in days]
+        except (TypeError, ValueError) as exc:
+            raise ValueError("allow_window 'days' must be weekday ints") from exc
+        if any(d < 1 or d > 7 for d in parsed):
+            raise ValueError("allow_window 'days' must be in 1..7")
+
+
 # ── gate-access decision (R4.1) ───────────────────────────────────────────────
 #
 # The deny-by-default decision for one plate read on a lane camera. Pure: takes
