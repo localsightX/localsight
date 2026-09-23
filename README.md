@@ -100,7 +100,12 @@ python scripts/local_cctv_rig.py stop           # tear down cleanly
 The rig sets `SSRF_ALLOWLIST=127.0.0.0/8` (loopback broker), 30 s recording
 segments, and its own dev secrets under `.rig/` (gitignored). Grant Camera
 permission to your terminal when macOS prompts, or use `start --source synthetic`
-for a moving test pattern. Details: `python scripts/local_cctv_rig.py --help`.
+for a moving test pattern. To soak a **real LAN camera** instead, export
+`RIG_SSRF_ALLOWLIST` covering its VLAN (the SSRF guard blocks private ranges by
+default) plus `RIG_CAM_NAME` / `RIG_CAM_MAIN_URL` (`/stream1`, optional
+`/stream2` substream) and run `start --source external` — no local broker or
+capture, and the soak's preflight adapts to it. Details:
+`python scripts/local_cctv_rig.py --help`.
 
 The rig runs the **staged YOLO11n detector** (registry-verified ONNX, CoreML
 on Apple Silicon) when `onnxruntime` is installed — real multi-class detection

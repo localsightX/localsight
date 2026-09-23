@@ -67,6 +67,10 @@ LOGS_DIR = os.path.join(RIG_DIR, "logs")
 PIDS_DIR = os.path.join(RIG_DIR, "pids")
 ENV_FILE = os.path.join(RIG_DIR, "env")
 SOAK_DIR = os.path.join(RIG_DIR, "soak")
+# How the rig was booted: "local" (FaceTime/synthetic via the loopback broker)
+# or "external" (the operator's real LAN camera — no local capture). The soak's
+# preflight reads this so an external run is not asked for a local broker.
+MODE_FILE = os.path.join(RIG_DIR, "mode")
 
 API_PORT = int(os.environ.get("RIG_PORT", "8000"))
 RTSP_PORT = int(os.environ.get("RIG_RTSP_PORT", "8554"))
@@ -207,7 +211,7 @@ def rig_env() -> dict:
             "JWT_SECRET": env.get("_RIG_JWT"),
             "MASTER_ENCRYPTION_KEY": env.get("_RIG_MEK"),
             "CORS_ALLOW_ORIGINS": f"http://localhost:{API_PORT}",
-            "SSRF_ALLOWLIST": "127.0.0.0/8",
+            "SSRF_ALLOWLIST": os.environ.get("RIG_SSRF_ALLOWLIST", "127.0.0.0/8"),
             "STORAGE_BACKEND": "local",
             "STORAGE_LOCAL_ROOT": DATA_STORAGE,
             "LOCALSIGHT_LIVE_DIR": LIVE_DIR,
@@ -263,6 +267,38 @@ def ensure_secrets() -> dict:
     for key in ("_RIG_JWT", "_RIG_MEK"):
         os.environ.setdefault(key, stored[key])
     return stored
+
+
+def _write_mode(mode: str) -> None:
+    """Record how the rig was booted so later commands (the soak preflight) know
+    which components to expect."""
+    os.makedirs(os.path.dirname(MODE_FILE) or ".", exist_ok=True)
+    with open(MODE_FILE, "w") as fh:
+        fh.write(mode)
+
+
+def rig_mode() -> str:
+    """'local' (FaceTime/synthetic through the loopback broker) or 'external'
+    (the operator's real LAN camera; no local capture). Rigs booted before the
+    marker existed have no file — they are local, so back-compat is preserved."""
+    try:
+        with open(MODE_FILE) as fh:
+            return fh.read().strip() or "local"
+    except FileNotFoundError:
+        return "local"
+
+
+def _soak_required_components(mode: str) -> list[str]:
+    """Components the soak's preflight demands before committing hours to a run.
+
+    External mode has no local broker or capture — the operator's camera is the
+    source — so requiring them there would block a correctly-running soak for no
+    reason. Local mode keeps demanding all four: a dead capture in local mode is
+    exactly the silent failure the preflight exists to catch.
+    """
+    if mode == "external":
+        return ["api", "worker"]
+    return ["mediamtx", "capture", "api", "worker"]
 
 
 # ── mediamtx + capture ─────────────────────────────────────────────────────
@@ -447,33 +483,87 @@ def login(base: str) -> str:
     raise RuntimeError(f"login failed after retries: {last}")
 
 
-def register_camera(base: str, token: str, source: str) -> str:
-    """Create-or-reuse the rig camera via the real API (SSRF-validated,
+def _create_or_reuse_camera(base: str, token: str, name: str, main_url: str,
+                            sub_url: str, resolution: str = "1280x720",
+                            fps: int = 15) -> str:
+    """Create-or-reuse a camera by name via the real API (SSRF-validated,
     encrypted at rest — the exact path a real operator's camera takes)."""
     st, cams = http_json("GET", "/api/cameras", base, token)
     if st != 200:
         die(f"camera list failed: {st}")
     for c in cams:
-        if c["name"] == CAM_NAME:
+        if c["name"] == name:
             say(f"camera already registered: {c['id']} (status {c['status']})")
             return c["id"]
-    auth = f"{RTSP_HOST}:{RTSP_PORT}"
-    main_url = f"rtsp://{auth}/{MAIN_PATH}"
-    sub_url = f"rtsp://{auth}/{SUB_PATH}"
     st, body = http_json("POST", "/api/cameras", base, token, body={
-        "name": CAM_NAME,
+        "name": name,
         "stream_url": main_url,
         "substream_url": sub_url,
-        "resolution": "1280x720" if source == "camera" else "1280x720 (synthetic)",
-        "fps": 15,
+        "resolution": resolution,
+        "fps": fps,
         "timezone": "UTC",
     })
     if st != 200:
         die(f"camera registration failed: {st} {body}")
-    cam_id = body["id"]
-    say(f"camera registered: {cam_id}")
-    _install_rules(base, token, cam_id)
-    return cam_id
+    say(f"camera registered: {body['id']}")
+    _install_rules(base, token, body["id"])
+    return body["id"]
+
+
+def register_camera(base: str, token: str, source: str) -> str:
+    """The local rig camera: the loopback broker publishing FaceTime/synthetic."""
+    auth = f"{RTSP_HOST}:{RTSP_PORT}"
+    return _create_or_reuse_camera(
+        base, token, CAM_NAME,
+        f"rtsp://{auth}/{MAIN_PATH}", f"rtsp://{auth}/{SUB_PATH}",
+        resolution="1280x720" if source == "camera" else "1280x720 (synthetic)",
+    )
+
+
+def provision_external_camera(base: str, token: str) -> str | None:
+    """Optionally register the operator's real LAN camera from RIG_CAM_* env.
+
+    External mode provisions nothing by default — the operator may have already
+    configured the camera they want to soak. When RIG_CAM_NAME and
+    RIG_CAM_MAIN_URL are set, do the create-or-reuse + rule install so the soak
+    has exactly one armed camera; rules matter because the soak needs analytic
+    fires (line_cross/loitering), not just presence. The substream defaults to
+    the main URL so a single-stream camera still drives the AI pipeline.
+    """
+    name = os.environ.get("RIG_CAM_NAME")
+    main_url = os.environ.get("RIG_CAM_MAIN_URL")
+    if not name or not main_url:
+        say("external mode: RIG_CAM_NAME/RIG_CAM_MAIN_URL not set — register your")
+        say("camera via POST /api/cameras (or export those vars and restart),")
+        say("arm its rules, then run `verify` before soaking")
+        return None
+    return _create_or_reuse_camera(
+        base, token, name, main_url,
+        os.environ.get("RIG_CAM_SUB_URL") or main_url,
+        resolution=os.environ.get("RIG_CAM_RESOLUTION", "1280x720"),
+    )
+
+
+def retire_rig_camera(base: str, token: str) -> None:
+    """Remove the dev FaceTime camera when booting in external mode.
+
+    Its loopback broker is not running, so the worker would only burn its
+    reconnect budget against rtsp://127.0.0.1:8554 and end up OFFLINE — and a
+    soak lists every camera, so that one stale row would fail the "cameras
+    stayed ONLINE" guard for a camera that is not even the subject. This script
+    created that camera, so deleting it here is symmetric; the DB cascade drops
+    its dev detections/tracks/segments (rule 8).
+    """
+    st, cams = http_json("GET", "/api/cameras", base, token)
+    if st != 200:
+        return
+    for c in cams or []:
+        if c["name"] == CAM_NAME:
+            st2, _ = http_json("DELETE", f"/api/cameras/{c['id']}", base, token)
+            if st2 == 200:
+                say(f"retired dev rig camera {c['id']} (external mode)")
+            else:
+                say(f"warning: could not retire dev rig camera (status {st2})")
 
 
 def _install_rules(base: str, token: str, cam_id: str) -> None:
@@ -519,6 +609,30 @@ def cmd_start(source: str) -> None:
     ensure_secrets()
     env = rig_env()
     base = f"http://127.0.0.1:{API_PORT}"
+    _write_mode("external" if source == "external" else "local")
+
+    if source == "external":
+        # The operator's real LAN camera is the source: no broker, no FaceTime
+        # capture. The camera is registered BEFORE the worker boots because the
+        # worker snapshots the camera list once at startup (review note D-6) — a
+        # camera added after would sit idle until a restart. RIG_SSRF_ALLOWLIST
+        # must cover the camera's VLAN (the guard blocks private ranges by
+        # default); the dev rig camera is retired so the soak lists only the
+        # camera the operator intends to watch.
+        start_api(env)
+        token = login(base)
+        retire_rig_camera(base, token)
+        cam_id = provision_external_camera(base, token)
+        start_worker(env)
+        say("rig is up (external camera):")
+        say(f"  dashboard    → http://localhost:{API_PORT}")
+        say(f"  login        → {ADMIN_EMAIL} / {ADMIN_PASS}")
+        if cam_id:
+            say(f"  camera       → {os.environ['RIG_CAM_NAME']} ({cam_id})")
+        else:
+            say("  camera       → register yours via POST /api/cameras")
+        say("run `verify` for end-to-end checks, `stop` to tear down")
+        return
 
     start_broker()
 
@@ -600,7 +714,12 @@ def cmd_verify() -> int:
     # 4. camera status via API (the F2 fix path)
     st, cams = http_json("GET", "/api/cameras", base, token)
     check("camera list", st == 200)
-    rig_cam = next((c for c in cams if c["name"] == CAM_NAME), None)
+    # External mode registers the operator's camera (RIG_CAM_NAME) and retires
+    # the dev one; fall back to the first registered camera so verify still
+    # probes the real device instead of hard-failing on a missing rig name.
+    want = os.environ.get("RIG_CAM_NAME") or CAM_NAME
+    rig_cam = next((c for c in cams if c["name"] == want),
+                   cams[0] if cams else None)
     if rig_cam:
         check("camera ONLINE", rig_cam["status"] == "ONLINE",
               f"status={rig_cam['status']} last_seen={rig_cam['last_seen']}")
@@ -841,7 +960,7 @@ def cmd_soak(hours: float, budget_per_cam_day: int, min_fires: int,
 
     # Preflight: the soak observes a running rig, it does not boot one. Failing
     # fast here beats recording hours of "no camera" as a pass.
-    for n in ("mediamtx", "capture", "api", "worker"):
+    for n in _soak_required_components(rig_mode()):
         if not is_running(n):
             die(f"rig component '{n}' is not running — start the rig first "
                 "(`python scripts/local_cctv_rig.py start`) then launch the soak")
@@ -1109,9 +1228,11 @@ def main() -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("setup", help="install brew deps + venv")
     p_start = sub.add_parser("start", help="boot the full rig")
-    p_start.add_argument("--source", choices=["camera", "synthetic"],
+    p_start.add_argument("--source", choices=["camera", "synthetic", "external"],
                          default=os.environ.get("RIG_SOURCE", "camera"),
-                         help="FaceTime camera or synthetic moving pattern")
+                         help="FaceTime camera, synthetic moving pattern, or "
+                              "'external' = the operator's real LAN camera "
+                              "(pairs with RIG_SSRF_ALLOWLIST + RIG_CAM_* env)")
     sub.add_parser("status", help="process/stream/API health")
     sub.add_parser("verify", help="end-to-end checks")
     p_bench = sub.add_parser("bench", help="detector latency budgets (R1 exit gate)")

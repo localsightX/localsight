@@ -211,6 +211,37 @@ def test_markdown_contains_kpi_paste_line():
     assert "0.667 alert/cam/day over 72 h (r3)" in md
 
 
+# ── external-camera mode (soaking a real LAN camera) ────────────────────────
+def test_ssrf_allowlist_defaults_to_loopback_only(monkeypatch):
+    """The rig must keep blocking private ranges unless the operator opts in —
+    loopback-only is what makes the dev rig safe against a misconfigured add."""
+    monkeypatch.delenv("RIG_SSRF_ALLOWLIST", raising=False)
+    assert _RIG.rig_env()["SSRF_ALLOWLIST"] == "127.0.0.0/8"
+
+
+def test_ssrf_allowlist_opens_the_camera_vlan(monkeypatch):
+    """RIG_SSRF_ALLOWLIST is how a real LAN camera (e.g. 192.168.x) gets past
+    the SSRF guard at registration — without it the add is rejected by design.
+    """
+    monkeypatch.setenv("RIG_SSRF_ALLOWLIST", "192.168.0.0/16")
+    assert _RIG.rig_env()["SSRF_ALLOWLIST"] == "192.168.0.0/16"
+
+
+def test_soak_preflight_components_depend_on_mode():
+    """Local mode demands the broker + capture (a dead capture there is exactly
+    the silent failure the preflight exists to catch); external mode has
+    neither, so demanding them would block a correctly-running soak."""
+    assert _RIG._soak_required_components("local") == ["mediamtx", "capture", "api", "worker"]
+    assert _RIG._soak_required_components("external") == ["api", "worker"]
+
+
+def test_rig_mode_marker_round_trips_and_defaults_to_local(tmp_path, monkeypatch):
+    monkeypatch.setattr(_RIG, "MODE_FILE", str(tmp_path / "mode"))
+    assert _RIG.rig_mode() == "local"   # no marker yet → pre-existing rigs
+    _RIG._write_mode("external")
+    assert _RIG.rig_mode() == "external"
+
+
 def test_verify_date_uses_the_utc_day_not_local():
     """Regression: cmd_verify built the timeline query date with time.strftime
     (local time), but /api/timeline filters by UTC day. On a UTC+4 box at 22:48
