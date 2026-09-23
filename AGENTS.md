@@ -170,6 +170,18 @@ tests/           unit + security + API + integration; tests/ui = Playwright e2e
   (the SSRF allowlist matches hostnames against CIDRs). `verify` is a
   ~15-check end-to-end probe (stream → recording → events → live) — the
   fastest real-feedback loop for anything touching video/AI.
+  - **Two modes**, recorded in `.rig/mode` and read by `rig_mode()`: `local`
+    (default; the full four-component stack above) and `external` (`start
+    --source external`) for soaking the operator's **real LAN camera** — boots
+    only API + worker, no broker/capture, registers + arms the camera from
+    `RIG_CAM_NAME` / `RIG_CAM_MAIN_URL` (+ optional `RIG_CAM_SUB_URL`)
+    **before** the worker boots (the worker snapshots the camera list once at
+    startup — review note D-6), and retires the dev FaceTime camera. The
+    camera's VLAN is private-range, so it needs `RIG_SSRF_ALLOWLIST` (e.g.
+    `192.168.0.0/16`) to pass the SSRF guard; **the default stays
+    loopback-only**, so a misconfigured add on a plain dev rig is still
+    refused. The soak preflight adapts per mode (`_soak_required_components`:
+    external → `["api","worker"]`) and `verify` targets `RIG_CAM_NAME`.
 - **Model staging**: `models/registry.json` currently declares three staged,
   hash-verified artifacts — `detector` (YOLO11n, COCO), `face_detector`
   (SCRFD 500M), `face_embedder` (ArcFace MobileFaceNet w600k). All from
