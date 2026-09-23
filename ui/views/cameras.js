@@ -14,11 +14,13 @@ import { label, tone, shortId } from "../core/format.js";
 import { navigate } from "../core/router.js";
 import { maskEditor } from "./mask_editor.js";
 import { rulesEditor } from "./rules_editor.js";
+import { laneEditor } from "./lane_editor.js";
 
 const TABS = [
   { id: "streams", label: "Streams", perm: "camera:view" },
   { id: "masks", label: "Privacy masks", perm: "camera:view" },
   { id: "rules", label: "Rules", perm: "rules:configure" },
+  { id: "gate-access", label: "Gate access", perm: "lanes:view" },
   { id: "retention", label: "Retention", perm: "camera:configure" },
   { id: "health", label: "Health", perm: "camera:view" },
 ];
@@ -172,6 +174,7 @@ async function loadCameraDetail(outEl, params) {
   }
   else if (tab === "retention") renderRetention(body, cam);
   else if (tab === "health") renderHealth(body, cam);
+  else if (tab === "gate-access") laneEditor(body, cam);
 
   // Removal lives OUTSIDE the tab body on purpose: it is offered on every tab
   // and must survive a tab switch (the tab body is rebuilt per tab). Gated on

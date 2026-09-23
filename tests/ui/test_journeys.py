@@ -124,7 +124,9 @@ class TestManageJourney:
         page.wait_for_selector(".cam-card")
         page.locator(".cam-card [data-act='detail']").first.click()
         page.wait_for_selector(".cam-detail")
-        assert page.locator(".tabs button").count() == 5
+        # ADMIN sees six detail tabs: Streams, Privacy masks, Rules, Gate
+        # access (R4.1 lanes:view), Retention, Health.
+        assert page.locator(".tabs button").count() == 6
         page.click("[data-tab='masks']")
         page.wait_for_selector(".mask-editor")
         # drawing works without a snapshot (honest offline canvas)
