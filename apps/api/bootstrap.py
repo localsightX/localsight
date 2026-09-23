@@ -135,6 +135,8 @@ def _ensure_columns(rt: Runtime) -> None:
         "ALTER TABLE events ADD COLUMN detail JSON",
         "ALTER TABLE tracks ADD COLUMN detail JSON",
         "ALTER TABLE cameras ADD COLUMN alert_budget_per_day INTEGER",
+        # R4.1: per-camera analytic switches (JSON {flag: bool}, off by default).
+        "ALTER TABLE cameras ADD COLUMN pipeline_flags JSON",
     ]
     for stmt in added:
         try:

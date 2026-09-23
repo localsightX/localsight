@@ -1,10 +1,33 @@
 # Operations Runbook
 
+Day-to-day operations for a running LocalSight deployment. If you're installing
+for the first time, start with [installation.md](installation.md); if
+something is broken, go to [troubleshooting.md](troubleshooting.md).
+
+## Contents
+- [Vendor integrations](#vendor-integrations)
+- [Local run (no containers)](#local-run-no-containers)
+- [Docker Compose](#docker-compose)
+- [Local debug access](#local-debug-access)
+- [Health & readiness](#health--readiness)
+- [Retention (configurable, automatic)](#retention-configurable-automatic)
+- [Backup and restore](#backup-and-restore)
+- [Capacity](#capacity)
+- [AI detector backends](#ai-detector-backends)
+- [Alert channels](#alert-channels)
+- [Troubleshooting](#troubleshooting)
+- [Secure deployment checklist](#secure-deployment-checklist)
+
 ## Vendor integrations
 - **TP-Link VIGI / Tapo**: RTSP/ONVIF-native. `POST /api/cameras/from-nvr` provisions a whole VIGI NVR in one call; `GET /api/cameras/presets` lists URL templates. Setup, ports, auth, and caveats: `docs/integrations/tplink-vigi.md`.
 - **Multi-vendor**: Any RTSP/ONVIF camera works. Use `POST /api/cameras/onvif/discover` to find devices on the LAN, then `POST /api/cameras/onvif/streams` to get RTSP URIs. Vendor presets available for Axis, Hanwha, Hikvision (ISAPI), Dahua (CGI), Reolink, Bosch, ONVIF, and GB/T 28181.
 
 ## Local run (no containers)
+
+A zero-infra way to run the stack on SQLite. For the full walkthrough —
+prerequisites, FFmpeg, first-run bootstrap and the verification checklist —
+see [installation.md](installation.md).
+
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
@@ -83,7 +106,9 @@ deletions are auditable. Per-camera overrides are supported via the camera
 > Warning: if the worker is not running, retention is not applied and storage/DB grow.
 > Keep the worker process up (it also runs recording, analytics, and the alert sender).
 
-## Backup & restore (test before relying on it)
+## Backup and restore
+
+Test the restore before you rely on it.
 - **Database + identity metadata + encrypted embeddings + config + audit**: `pg_dump`
   (or SQLite `cp`). Restore into a fresh DB and verify row counts.
 - **Encrypted embeddings are useless without `MASTER_ENCRYPTION_KEY`** — back up the
@@ -189,7 +214,13 @@ curl -X POST http://localhost:8000/api/alerts/test -H "Authorization: Bearer $TO
 ```
 
 ## Troubleshooting
-- **App won't start**: check for placeholder secrets (`JWT_SECRET`/`MASTER_ENCRYPTION_KEY`).
+
+The quick first-aid list is below; for symptom → cause → fix organized by area
+(startup, cameras, recording/live, alerts, storage/performance) and the
+diagnostics to gather before filing an issue, see
+[troubleshooting.md](troubleshooting.md).
+
+- **App won't start**: check for placeholder secrets (`JWT_SECRET`/`MASTER_ENCRYPTION_KEY`)
 - **Camera OFFLINE**: gateway reconnects with backoff; check RTSP URL + SSRF allowlist
   (private/loopback blocked unless listed) and NVR reachability.
 - **GPU missing**: reduce `AI_INFERENCE_FPS`. The `reference` detector needs no GPU;

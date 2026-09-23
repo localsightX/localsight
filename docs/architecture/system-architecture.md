@@ -86,6 +86,22 @@ Frame → PlateDetection (crop) → OCR (character recognition) → Watchlist ma
                                                            → Event (encrypted plate)
 ```
 
+#### Gate-access lanes (R4.1 — schema landed, wiring in progress)
+
+A camera with `pipeline_flags.lane_access` enabled becomes an access-control point.
+The same `plate_hash` the ANPR pipeline writes to `Event.detail` is joined against
+`LaneWhitelistEntry`; a match inside the lane's allow window issues a barrier command
+(`webhook` / `mqtt`), everything else is logged and denied:
+
+```
+Event(plate_hash) → LaneWhitelistEntry join → is_within_window → barrier command
+                     (miss / outside window / lane disabled)   → denied event, no relay
+```
+
+Deny-by-default: a malformed allow window denies rather than opening the barrier, and
+`cooldown_sec` makes relay commands idempotent per plate. See
+[`docs/architecture/erd.md`](erd.md) ("Lane / LaneWhitelistEntry tables").
+
 ## State model
 
 - **Camera status** (independent per camera): `ONLINE | DEGRADED | OFFLINE | RECONNECTING`
@@ -150,7 +166,7 @@ Timeline query (date, camera_id)
 
 ## CI/CD & supply-chain integrity
 
-Every commit goes through a 9-job GitHub Actions pipeline that enforces quality,
+Every commit goes through a 10-job GitHub Actions pipeline that enforces quality,
 security, and operational standards before merge. The pipeline is documented in
 detail in `docs/operations/ci-cd-pipeline.md`.
 
@@ -174,8 +190,8 @@ detail in `docs/operations/ci-cd-pipeline.md`.
                                  ▼
    ┌─────────────────────────────────────────────────────────────────┐
    │                      Quality Gate                                │
-   │  Blocks merge on lint/test failures; security findings are       │
-   │  warnings tracked in the Security tab                            │
+   │  Blocks merge on lint / test / ui-e2e failures; security         │
+   │  findings are warnings tracked in the Security tab               │
    └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -195,7 +211,7 @@ detail in `docs/operations/ci-cd-pipeline.md`.
 - **Multi-platform build**: `linux/amd64` (servers) and `linux/arm64` (Jetson, RPi)
 - **SBOM**: SPDX-JSON generated per release via Trivy
 - **Provenance**: SLSA-style attestation from `docker/build-push-action@v6`
-- **GHCR**: `ghcr.io/jatinkray/localsight` with auto-tags
+- **GHCR**: `ghcr.io/localsightx/localsight` (derived from `github.repository` in CI) with auto-tags
 
 ### Branch protection recommendations
 

@@ -29,7 +29,7 @@ Real screenshots of the running product (demo dataset, admin role):
 | **Evidence drawer** — playback, context, signed clip export | **Account** — password, TOTP MFA, sessions, timezone |
 
 More in [`docs/USER_GUIDE.md`](docs/USER_GUIDE.md) (every section shows its
-screen) and the [product tour on the project site](https://jatinkray.github.io/localsight.github.io/).
+screen) and the [product tour on the project site](https://localsightx.github.io/).
 
 ## Capabilities
 
@@ -42,6 +42,7 @@ screen) and the [product tour on the project site](https://jatinkray.github.io/l
 | Tracking | ✅ production | SORT-style motion-prediction tracker for stable IDs; appearance ReID needs a staged embedding model |
 | Behavior analytics (rules) | ✅ production | Line-cross, intrusion, loitering, object-left/removed, crowd — per-camera JSON |
 | ANPR / LPR | ✅ pipeline; ⚙️ model-dependent | Cropped + throttled + deduped; plate values encrypted at rest. Real OCR needs a staged plate detector+OCR model |
+| Gate access / LPR lanes (R4.1) | 🧱 in development | `Lane` (1:1 with a camera) + keyed-HMAC `plate_hash` whitelist + allow-window schedule + barrier relay; off unless `pipeline_flags.lane_access` is set |
 | Continuous recording | ✅ production | Main-stream segmented MP4 → StorageProvider; `VideoSegment` rows; requires FFmpeg |
 | Live view | ✅ production | Authorized LL-HLS gateway (ffmpeg transcode of substream); requires FFmpeg |
 | Alerts | ✅ production | Webhook / email / MQTT / push routed per rule_type+camera via `AlertRoute`; per-route cooldown to prevent alert storms; webhook URLs SSRF-validated |
@@ -52,6 +53,10 @@ screen) and the [product tour on the project site](https://jatinkray.github.io/l
 ⚙️ = works out of the box with a deterministic **reference** implementation; swap in a
 staged model via the `ModelRegistry` for production accuracy. There are no insecure
 defaults and no network calls to third parties.
+
+🧱 = the data model is landed (`Lane`, `LaneWhitelistEntry`, `cameras.pipeline_flags`
+— see [`docs/architecture/erd.md`](docs/architecture/erd.md)); the barrier action,
+lane API and worker gating are in development, so nothing opens a gate yet.
 
 ## Quick start (local, zero infra)
 
@@ -120,10 +125,10 @@ operator-side staging path any production model takes.
 pip install -r requirements.txt
 pip install pytest pytest-cov httpx numpy
 rm -f test_localsight.db
-pytest -q                       # 274 tests: auth, RBAC, SSRF, encryption, analytics, pipeline, API, live, alerts, forensic search, ONNX detector, perf gates, review regressions, rule grammar + replay tester + alert budgets
+pytest -q                       # 293 backend tests (+46 browser e2e = 339 total): auth, RBAC, SSRF, encryption, analytics, pipeline, API, live, alerts, forensic search, ONNX detector, perf gates, review regressions, rule grammar + replay tester + alert budgets
 ```
 
-Coverage report: `pytest --cov=packages --cov=apps --cov-fail-under=50` (currently 78%).
+Coverage report: `pytest --cov=packages --cov=apps --cov-fail-under=50` (currently 81%).
 
 The suite includes regression tests from the architectural review
 (`docs/reviews/CODE_ANALYSIS_REPORT.md`): `Event.detail` round-trips through the
@@ -135,14 +140,17 @@ detection write-gating, and live-stream stop/reap.
 Every push to `main` and every PR runs a 10-job GitHub Actions pipeline:
 
 - **lint** — ruff + mypy
-- **unit tests** — pytest against SQLite (274 tests, ~60s)
+- **unit tests** — pytest against SQLite (293 tests, ~50s)
 - **integration** — pytest against PostgreSQL + pgvector
 - **dependency audit** — pip-audit (OSV/PyPI) + Safety (pyup.io)
 - **CodeQL SAST** — GitHub code scanning for Python
 - **Semgrep SAST** — community + OWASP + secrets rules
 - **container scan** — Trivy SARIF, CRITICAL/HIGH CVE check
 - **docker build** — multi-platform (amd64/arm64) push to GHCR
-- **quality gate** — blocks merge on lint/test failures
+- **UI e2e** — Playwright browser suite (46 tests): journeys, axe-core
+  accessibility, live-CSP console gate, visual regression, perf budgets
+- **quality gate** — aggregates every job and blocks merge on lint/test/ui-e2e
+  failures
 
 All security tools are free tier. SBOM (SPDX) is generated per release.
 See `docs/operations/ci-cd-pipeline.md` for the full pipeline reference and
@@ -314,7 +322,7 @@ infrastructure/  docker, compose, nginx, monitoring
 docs/             architecture, security, operations, integrations, api
 scripts/          gen_env.py, capacity.py
 ui/               static dashboard (served at /)
-tests/            unit + security + integration (274 tests)
+tests/            unit + security + integration (293 tests, +46 browser e2e)
 ```
 
 ## Status
@@ -337,6 +345,8 @@ via the `ModelRegistry` to reach production accuracy — the interfaces are unch
 
 See `docs/` for architecture decision records, threat model, ERD, security controls, and
 the operations runbook. Operator-facing usage documentation is in
-`docs/USER_GUIDE.md`; engineering-agent orientation (invariants, workflow)
+`docs/USER_GUIDE.md`; setup & installation in
+`docs/operations/installation.md`; troubleshooting in
+`docs/operations/troubleshooting.md`; engineering-agent orientation (invariants, workflow)
 is in `AGENTS.md`; the full architectural review with evidence and fix
 rationale is in `docs/reviews/CODE_ANALYSIS_REPORT.md`.

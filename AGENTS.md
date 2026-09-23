@@ -16,7 +16,8 @@ style issues.
 apps/api/        FastAPI app: routers (search.py = forensic search + saved
                  searches), bootstrap (runtime), config, deps
 apps/worker/     per-camera AI pipelines, recorder, retention, alert fan-out
-packages/domain/ ORM models, schemas, timeutil, events
+packages/domain/ ORM models, schemas, timeutil, events, lane.py (gate-access
+                 LPR allow windows + per-camera pipeline switches)
 packages/security/ passwords, JWT, RBAC, crypto (envelope), SSRF, rate-limit, MFA, audit
 packages/ai/     detector/tracker/face/matcher interfaces + reference impls + pipeline
                  detectors.py (ONNX/TensorRT/OpenVINO/TFLite + COCO→platform label
@@ -40,6 +41,8 @@ models/          registry.json (name/path/SHA-256/source/license). staged/
                  yolo11n-detect.onnx, faces/det_500m.onnx, faces/w600k_mbf.onnx
 infrastructure/  Dockerfile, compose stack, nginx, monitoring
 docs/            architecture, security, operations, integrations, api, reviews
+                 operations/ = runbook.md + installation.md (setup) +
+                 troubleshooting.md + onnx-detector.md + ci-cd-pipeline.md
 scripts/         gen_env.py, capacity.py, seed_dev_data.py, local_cctv_rig.py
                  (incl. `bench`), bench_detector.py, stage_model.py,
                  ui_audit.py / ui_design_metrics.py / ui_maturity_scan.py /
@@ -149,9 +152,9 @@ tests/           unit + security + API + integration; tests/ui = Playwright e2e
 
 - **Dev**: SQLite, tests run against an in-memory-ish session-scoped app
   (`conftest.py`); `.venv` at repo root; `pytest tests/ -q` must pass
-  (**currently 274 tests** — `test_surveillance.py` carries 113 of
+  (**currently 305 tests** — `test_surveillance.py` carries 113 of
   them). The UI e2e suite is separate: `pytest tests/ui -m ui` collects 46
-  more (320 total) — it boots a real uvicorn server + seeded throwaway DB and
+  more (339 total) — it boots a real uvicorn server + seeded throwaway DB and
   drives it with Playwright (needs `playwright`, `pytest-playwright`,
   chromium, ffmpeg); `pytest tests/` never collects it (deselected via the `ui`
   marker, pytest.ini).
@@ -224,7 +227,11 @@ tests/           unit + security + API + integration; tests/ui = Playwright e2e
   for additive columns on existing tables. Each ALTER runs in its own
   transaction; only "duplicate column"/"already exists" errors are swallowed.
   Alembic is the intended destination (see docs/reviews report D-5) — additive
-  changes must be added to `_ensure_columns` until then.
+  changes must be added to `_ensure_columns` until then. The R4.1 lane tables
+  (`lanes`, `lane_whitelist_entries`) and `cameras.pipeline_flags` followed this
+  pattern: `create_all` for the tables, `_ensure_columns` for the ALTER, so a
+  pre-R4.1 database upgrades in place (covered by
+  `test_pipeline_flags_added_on_upgrade_from_legacy_db`).
 - **Worker model**: one thread per camera, ffmpeg per thread; SIGTERM sets the
   stop event so recorders flush and children are reaped. The alert sender and
   retention sweeper run on their own daemon threads.
@@ -270,7 +277,7 @@ tests/           unit + security + API + integration; tests/ui = Playwright e2e
 
 ## Quality gates
 
-- `pytest tests/ -q` — all green (**274 passed**, 46 deselected) in ~50 s.
+- `pytest tests/ -q` — all green (**305 passed**, 46 deselected) in ~50 s.
 - `pytest tests/ui -m ui` — the browser suite (Wave 5 + maturity waves); run it
   before merging UI changes (needs chromium via `playwright install`, ffmpeg).
   46 tests: journeys (13), a11y/axe, CSP console, design tokens, flows,

@@ -35,6 +35,24 @@ def _uuid() -> str:
     return uuid.uuid4().hex
 
 
+# Per-camera analytic switches (R4.1, roadmap definition-of-done 8): every
+# analytic ships behind a per-camera flag and is OFF unless the operator turns
+# it on. The worker resolves them through packages.domain.lane.
+# pipeline_flag_enabled so "off unless enabled" has exactly one definition.
+PIPELINE_FLAG_ANPR = "anpr"                # plate recognition on vehicle crops
+PIPELINE_FLAG_LANE_ACCESS = "lane_access"  # gate-access LPR mode (R4.1)
+PIPELINE_FLAG_SPEED = "speed"              # R4.2 speed estimation
+PIPELINE_FLAG_MMR = "mmr"                  # R4.3 make/model/class tags
+PIPELINE_FLAGS_KNOWN = frozenset(
+    {
+        PIPELINE_FLAG_ANPR,
+        PIPELINE_FLAG_LANE_ACCESS,
+        PIPELINE_FLAG_SPEED,
+        PIPELINE_FLAG_MMR,
+    }
+)
+
+
 class User(Base):
     __tablename__ = "users"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
@@ -131,6 +149,10 @@ class Camera(Base):
     # R3.6 daily alert budget: null = platform default (AI_*/ALERT_* setting),
     # 0 = unlimited, N = cap the camera's alert fan-out at N per UTC day.
     alert_budget_per_day: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Per-camera analytic switches (R4.1): {flag: bool}, null/missing/false = off.
+    # Keys are the PIPELINE_FLAG_* constants above; read via
+    # packages.domain.lane.pipeline_flag_enabled.
+    pipeline_flags: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -342,6 +364,79 @@ class AlertRoute(Base):
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     cooldown_sec: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class Lane(Base):
+    """A camera configured as a gate-access lane (R4.1).
+
+    Binds a camera's ANPR stream to an access-control policy: a whitelist of
+    keyed-HMAC plate hashes (`LaneWhitelistEntry`), an allow-window schedule,
+    and a barrier action — a webhook/MQTT relay command. Deny-by-default: a
+    plate that does not match the whitelist inside its allow window is logged
+    as an event and NEVER triggers the barrier.
+
+    One lane per camera: a camera either is a lane or it is not, enforced by
+    the unique constraint — double-arming one camera would race two relays.
+    """
+    __tablename__ = "lanes"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    camera_id: Mapped[str] = mapped_column(
+        ForeignKey("cameras.id", ondelete="CASCADE"), index=True
+    )
+    name: Mapped[str] = mapped_column(String(255), default="")
+    # Barrier/relay action channel: webhook | mqtt. The destination is
+    # SSRF-gated at create time (_validate_route_destination, AGENTS.md rule
+    # 2) and its credentials live envelope-encrypted in barrier_config_enc,
+    # exactly like alert_routes.config_enc.
+    barrier_channel: Mapped[str] = mapped_column(String(16), default="webhook")
+    barrier_config_enc: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Lane-level allow window (see packages.domain.lane.is_within_window);
+    # null = no schedule restriction (24/7). Entries may override per plate.
+    allow_window: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # Relay command idempotency: a second open for the same plate within this
+    # window is suppressed (R4.1 acceptance: commands idempotent per plate).
+    cooldown_sec: Mapped[int] = mapped_column(Integer, default=30, server_default="30")
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    # Operator who armed the lane — audit-logged with every open/close
+    # alongside the plate hash. Plain string, mirroring Person.created_by.
+    armed_by: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    entries: Mapped[list["LaneWhitelistEntry"]] = relationship(
+        cascade="all, delete-orphan", passive_deletes=True, back_populates="lane"
+    )
+
+    __table_args__ = (UniqueConstraint("camera_id", name="uq_lane_camera"),)
+
+
+class LaneWhitelistEntry(Base):
+    """One allowed plate for a lane (R4.1).
+
+    Stores only `plate_hash` — the master-key-bound HMAC token produced by
+    `CryptoBox.hmac_str`, the same token space the ANPR pipeline writes to
+    `Event.detail.plate_hash` — so a whitelist match is an exact join against
+    the R2 plate index and plaintext plates never reach the database. Master
+    key rotation invalidates every entry by design (re-enroll the plates).
+    """
+    __tablename__ = "lane_whitelist"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    lane_id: Mapped[str] = mapped_column(
+        ForeignKey("lanes.id", ondelete="CASCADE"), index=True
+    )
+    plate_hash: Mapped[str] = mapped_column(String(64), index=True)
+    label: Mapped[str] = mapped_column(String(255), default="")  # operator note, never the plate
+    # Per-plate override of the lane window (null = inherit Lane.allow_window);
+    # e.g. a delivery pass valid 09:00-13:00 weekdays only.
+    allow_window: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_by: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    lane: Mapped["Lane"] = relationship("Lane", back_populates="entries")
+
+    __table_args__ = (
+        UniqueConstraint("lane_id", "plate_hash", name="uq_lane_whitelist_plate"),
+    )
 
 
 # Indexes for time-range and identity queries.
