@@ -40,6 +40,8 @@ models/          registry.json (name/path/SHA-256/source/license). staged/
                  yolo11n-detect.onnx, faces/det_500m.onnx, faces/w600k_mbf.onnx
 infrastructure/  Dockerfile, compose stack, nginx, monitoring
 docs/            architecture, security, operations, integrations, api, reviews
+                 operations/ = runbook.md + installation.md (setup) +
+                 troubleshooting.md + onnx-detector.md + ci-cd-pipeline.md
 scripts/         gen_env.py, capacity.py, seed_dev_data.py, local_cctv_rig.py
                  (incl. `bench`), bench_detector.py, stage_model.py,
                  ui_audit.py / ui_design_metrics.py / ui_maturity_scan.py /
@@ -149,9 +151,9 @@ tests/           unit + security + API + integration; tests/ui = Playwright e2e
 
 - **Dev**: SQLite, tests run against an in-memory-ish session-scoped app
   (`conftest.py`); `.venv` at repo root; `pytest tests/ -q` must pass
-  (**currently 274 tests** — `test_surveillance.py` carries 113 of
+  (**currently 293 tests** — `test_surveillance.py` carries 113 of
   them). The UI e2e suite is separate: `pytest tests/ui -m ui` collects 46
-  more (320 total) — it boots a real uvicorn server + seeded throwaway DB and
+  more (339 total) — it boots a real uvicorn server + seeded throwaway DB and
   drives it with Playwright (needs `playwright`, `pytest-playwright`,
   chromium, ffmpeg); `pytest tests/` never collects it (deselected via the `ui`
   marker, pytest.ini).
@@ -270,7 +272,7 @@ tests/           unit + security + API + integration; tests/ui = Playwright e2e
 
 ## Quality gates
 
-- `pytest tests/ -q` — all green (**274 passed**, 46 deselected) in ~50 s.
+- `pytest tests/ -q` — all green (**293 passed**, 46 deselected) in ~50 s.
 - `pytest tests/ui -m ui` — the browser suite (Wave 5 + maturity waves); run it
   before merging UI changes (needs chromium via `playwright install`, ffmpeg).
   46 tests: journeys (13), a11y/axe, CSP console, design tokens, flows,

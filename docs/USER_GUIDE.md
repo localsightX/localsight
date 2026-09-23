@@ -2,9 +2,14 @@
 
 End-user documentation for operators of a LocalSight deployment: logging in,
 managing cameras, watching live and recorded video, working with events and
-alerts, and configuring privacy controls. For developer/agent documentation
-see `AGENTS.md`; for operations (deployment, retention, troubleshooting) see
-`docs/operations/runbook.md`.
+alerts, and configuring privacy controls.
+
+- **Installing or upgrading for the first time** →
+  [`docs/operations/installation.md`](operations/installation.md)
+- **Something is broken** → [`docs/operations/troubleshooting.md`](operations/troubleshooting.md)
+- **Day-to-day operations (health, retention, alerts, backup)** →
+  [`docs/operations/runbook.md`](operations/runbook.md)
+- **Developer / engineering-agent documentation** → `AGENTS.md`
 
 > The screenshots in this guide are real captures of the running product
 > (demo dataset, admin role). Files live in `docs/img/`; regenerate them any
@@ -12,8 +17,9 @@ see `AGENTS.md`; for operations (deployment, retention, troubleshooting) see
 > e2e suite's visual baselines.
 
 ## Contents
-1. [Logging in](#logging-in)
-2. [Dashboards at a glance](#dashboards-at-a-glance)
+1. [Getting set up (first time)](#getting-set-up-first-time)
+2. [Logging in](#logging-in)
+3. [Dashboards at a glance](#dashboards-at-a-glance)
 3. [Managing cameras](#managing-cameras)
    - [Privacy masks](#privacy-masks)
    - [The Cameras screens (Wave 3)](#the-cameras-screens-wave-3)
@@ -40,6 +46,30 @@ see `AGENTS.md`; for operations (deployment, retention, troubleshooting) see
 
 *(Wave 5 note: the Privacy view also carries the opt-in UI-marks card
 described above.)*
+
+---
+
+## Getting set up (first time)
+
+This guide assumes LocalSight is already running. If it isn't, the full
+install path — prerequisites, FFmpeg, a Python or Docker Compose install, and
+a first-run verification checklist — is in
+[`docs/operations/installation.md`](operations/installation.md). In short:
+
+1. **Install** (5–10 min): generate secrets with `python scripts/gen_env.py`,
+   then start the API (`uvicorn apps.api.main:app`) **and** the worker
+   (`python -m apps.worker`) as two processes. The dashboard is served at `/`.
+2. **Sign in** with the bootstrap admin recorded during install (see
+   [Logging in](#logging-in) below).
+3. **Add a camera** via **Cameras → + Add camera** and watch the wizard's
+   **verify** step pull a real frame before you commit.
+4. **Confirm ingestion**: the camera's status dot flips to streaming within
+   ~30 s, events appear, and the Timeline fills with recording coverage.
+5. **Turn on what you need**: behavior rules, alert routes, and (with a
+   documented lawful basis) identity enrollment.
+
+If a step fails, [`docs/operations/troubleshooting.md`](operations/troubleshooting.md)
+is organized by the exact symptom.
 
 ---
 

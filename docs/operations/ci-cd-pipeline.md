@@ -6,39 +6,43 @@ security, and operational standards on every pull request and merge.
 ## Overview
 
 The pipeline runs on every push to `main`, `develop`, or any `feat/**` branch, and
-on every pull request. It is composed of nine jobs that can run in parallel, then
+on every pull request. It is composed of ten jobs that can run in parallel, then
 a final quality gate that aggregates the results and blocks merge on hard failures.
 
 ```
    ┌─────────────────────────────────────────────────────────────────┐
-   │                       Git Push / PR                                │
-   └─────────────────────────────┬─────────────────────────────────────┘
+   │                       Git Push / PR                             │
+   └─────────────────────────────┬───────────────────────────────────┘
                                  │
-   ┌─────────────────────────────┴─────────────────────────────┐
-   │                  9-Job Quality Pipeline                       │
-   │                                                                │
-   │   ┌─────────────┐  ┌─────────────┐  ┌─────────────┐          │
-   │   │    lint     │  │  unit tests │  │ integration │          │
-   │   │ (ruff+mypy) │  │   (SQLite)  │  │  (postgres) │          │
-   │   └──────┬──────┘  └──────┬──────┘  └──────┬──────┘          │
-   │          │                │                │                   │
-   │   ┌──────┴──────┐  ┌──────┴──────┐  ┌──────┴──────┐          │
-   │   │   pip-audit │  │  CodeQL     │  │  Semgrep    │          │
-   │   │   + Safety  │  │   SAST      │  │   SAST      │          │
-   │   └──────┬──────┘  └──────┬──────┘  └──────┬──────┘          │
-   │          │                │                │                   │
-   │   ┌──────┴────────────────────────────┐  │                   │
-   │   │   Trivy container scan (SARIF)    │  │                   │
-   │   └──────┬────────────────────────────┘  │                   │
-   │          │                │                │                   │
-   │   ┌──────┴────────────────────────────┐  │                   │
-   │   │   Docker build + push (main only) │  │                   │
-   │   └──────┬────────────────────────────┘  │                   │
-   │          │                                │                   │
-   │   ┌──────┴────────────────────────────────┴────────────┐    │
-   │   │            Quality Gate (aggregator)                │    │
-   │   │   Fails merge if lint or tests fail.                │    │
-   │   └─────────────────────────────────────────────────────┘    │
+   ┌─────────────────────────────┴───────────────────────────────────┐
+   │                  10-Job Quality Pipeline                        │
+   │                                                                 │
+   │   ┌─────────────┐  ┌─────────────┐  ┌─────────────┐             │
+   │   │    lint     │  │  unit tests │  │ integration │             │
+   │   │ (ruff+mypy) │  │   (SQLite)  │  │  (postgres) │             │
+   │   └──────┬──────┘  └──────┬──────┘  └──────┬──────┘             │
+   │          │                │                 │                    │
+   │   ┌──────┴──────┐  ┌──────┴──────┐  ┌──────┴──────┐             │
+   │   │  pip-audit  │  │   CodeQL    │  │  Semgrep    │             │
+   │   │  + Safety   │  │    SAST     │  │    SAST     │             │
+   │   └──────┬──────┘  └──────┬──────┘  └──────┬──────┘             │
+   │          │                 │                 │                    │
+   │   ┌──────┴──────────────────────────────────┐                   │
+   │   │   Trivy container scan (SARIF)          │                   │
+   │   └──────┬──────────────────────────────────┘                   │
+   │          │                 │                 │                    │
+   │   ┌──────┴──────────────────────────────────┐                   │
+   │   │   Docker build + push (main only)       │                   │
+   │   └──────┬──────────────────────────────────┘                   │
+   │          │                                                       │
+   │   ┌──────┴──────────────────────────────────┐                   │
+   │   │   ui-e2e: browser a11y/CSP/perf gates   │                   │
+   │   └──────┬──────────────────────────────────┘                   │
+   │          │                                                       │
+   │   ┌──────┴───────────────────────────────────────────────────┐   │
+   │   │            Quality Gate (aggregator)                     │   │
+   │   │   Fails merge on lint / test / ui-e2e failures.          │   │
+   │   └───────────────────────────────────────────────────────────┘   │
    └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -68,7 +72,7 @@ Runs the full pytest suite against an isolated SQLite database. The conftest
 | Test artifacts | `coverage.xml`, `test_localsight.db`, `.pytest_cache/` |
 
 The job installs `ffmpeg` system-wide because the recorder tests exercise the
-segmentation logic. All 66 tests run in ~17 seconds.
+segmentation logic. All 293 tests run in ~50 seconds.
 
 ### 3. `integration` — PostgreSQL integration
 
@@ -136,12 +140,34 @@ Pushes to `ghcr.io/<org>/<repo>` with the following tags:
 - `latest` on the default branch
 - `vX.Y.Z` for semver tags
 
-### 9. `quality-gate` — Aggregator
+### 9. `ui-e2e` — Browser end-to-end (merge-blocking)
+
+The Playwright suite in `tests/ui` boots a real uvicorn server with a seeded
+throwaway DB and drives the actual dashboard in Chromium. It deselects itself
+from the default `pytest tests/` run via the `ui` marker (see `pytest.ini`), so
+this is the only job that exercises it.
+
+| Gate | What it asserts |
+|------|-----------------|
+| Journeys | Login → cameras → events → clip export, per-view flows (13 tests) |
+| Accessibility | axe-core scan per view — zero violations (WCAG 2.1 AA) |
+| CSP console | Zero console errors under the live Content-Security-Policy |
+| Visual regression | 12 states against committed baselines in `ui_audit/baselines/` |
+| Perf budgets | TTI < 3 s, JS payload < 300 KB, view latency < 2.5 s |
+
+46 tests total. Regenerate visual baselines with `UPDATE_BASELINES=1`. Requires
+`playwright`, `pytest-playwright`, chromium and ffmpeg. This job is
+**merge-blocking** — a regression in accessibility, CSP cleanliness, or the
+design system fails the PR, not just the job.
+
+### 10. `quality-gate` — Aggregator
 
 Runs after all other jobs. Fails the workflow if any of:
 - `lint` failed
 - `test` failed
 - `integration` failed
+- `ui-e2e` failed — the design gates (a11y / CSP / visual / perf) are
+  merge-blocking; see the job log for the failing assertion
 
 Security scan failures (`security-deps`, `sast-*`, `container-scan`) are
 warnings only — they don't block the merge. This lets the team iterate on

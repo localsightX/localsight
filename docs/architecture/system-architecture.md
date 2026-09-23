@@ -150,7 +150,7 @@ Timeline query (date, camera_id)
 
 ## CI/CD & supply-chain integrity
 
-Every commit goes through a 9-job GitHub Actions pipeline that enforces quality,
+Every commit goes through a 10-job GitHub Actions pipeline that enforces quality,
 security, and operational standards before merge. The pipeline is documented in
 detail in `docs/operations/ci-cd-pipeline.md`.
 
@@ -174,8 +174,8 @@ detail in `docs/operations/ci-cd-pipeline.md`.
                                  ▼
    ┌─────────────────────────────────────────────────────────────────┐
    │                      Quality Gate                                │
-   │  Blocks merge on lint/test failures; security findings are       │
-   │  warnings tracked in the Security tab                            │
+   │  Blocks merge on lint / test / ui-e2e failures; security         │
+   │  findings are warnings tracked in the Security tab               │
    └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -195,7 +195,7 @@ detail in `docs/operations/ci-cd-pipeline.md`.
 - **Multi-platform build**: `linux/amd64` (servers) and `linux/arm64` (Jetson, RPi)
 - **SBOM**: SPDX-JSON generated per release via Trivy
 - **Provenance**: SLSA-style attestation from `docker/build-push-action@v6`
-- **GHCR**: `ghcr.io/jatinkray/localsight` with auto-tags
+- **GHCR**: `ghcr.io/localsightx/localsight` (derived from `github.repository` in CI) with auto-tags
 
 ### Branch protection recommendations
 

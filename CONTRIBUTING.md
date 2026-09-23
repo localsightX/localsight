@@ -112,7 +112,7 @@ pip-audit
 
 - [ ] `ruff check .` passes with no errors (`ruff.toml` defines the rule set)
 - [ ] `mypy packages apps` passes with no type errors
-- [ ] `pytest tests/ -v` passes (all 74+ tests green)
+- [ ] `pytest tests/ -v` passes (293 backend tests + 46 browser e2e, all green)
 - [ ] Regression test included for any bug fix — a fix without a test that
       would have caught the bug will be sent back
 - [ ] `pip-audit` shows no critical/high vulnerabilities
@@ -140,8 +140,10 @@ When adding or changing a feature, update:
 1. **README.md** — capabilities table if a feature is promoted to production
 2. **docs/api/openapi-summary.md** — new endpoints with use-case examples
 3. **docs/architecture/system-architecture.md** — data flow or component changes
-4. **docs/operations/runbook.md** — operational procedures
-5. **docs/USER_GUIDE.md** — operator-facing usage (with a real screenshot)
+4. **docs/operations/installation.md** — setup & installation steps
+5. **docs/operations/runbook.md** — operational procedures
+6. **docs/operations/troubleshooting.md** — symptom → cause → fix entries
+7. **docs/USER_GUIDE.md** — operator-facing usage (with a real screenshot)
 
 ## Filing Issues
 
