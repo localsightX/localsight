@@ -26,6 +26,7 @@ from apps.api.routers import (
     auth,
     cameras,
     events,
+    lanes,
     persons,
     search,
     system,
@@ -101,6 +102,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(search.router)
     app.include_router(live.router)
     app.include_router(rules.router)
+    app.include_router(lanes.router)
 
     # Serve transcoded live HLS segments (written by the live gateway in live.py).
     # LIVE_DIR is the single shared source of truth for both the transcode root

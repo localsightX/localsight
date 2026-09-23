@@ -28,6 +28,12 @@ PERMISSIONS: set[str] = {
     # lookup over stored events/tracks, and saving those lookups for reuse.
     "search:view",
     "search:save",
+    # R4.1 gate access: configure a camera as an LPR lane (barrier relay is a
+    # privileged physical side effect) and enroll whitelisted plates. View is
+    # split from manage so a security operator can audit lane policy without
+    # being able to arm a barrier.
+    "lanes:view",
+    "lanes:manage",
 }
 
 # Role -> permission set.
@@ -51,6 +57,8 @@ ROLE_PERMISSIONS: dict[str, set[str]] = {
         "live:view",
         "search:view",
         "search:save",
+        "lanes:view",
+        "lanes:manage",
     },
     "ANALYST": {
         "camera:view",
@@ -63,6 +71,7 @@ ROLE_PERMISSIONS: dict[str, set[str]] = {
         "live:view",
         "search:view",
         "search:save",
+        "lanes:view",
     },
     "VIEWER": {
         "camera:view",

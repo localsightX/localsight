@@ -112,16 +112,40 @@ curl "http://localhost:8000/api/search/plates?q=ab-12%20cd" \
 # stored, returned, or searched. Partial plates are not searchable by design.
 ```
 
-### Gate-access lanes (R4.1 — in development)
+### Gate-access lanes (R4.1)
 
-The lane schema has landed — `Lane` and `LaneWhitelistEntry` tables plus
-`cameras.pipeline_flags` (see [`docs/architecture/erd.md`](../architecture/erd.md))
-— but the endpoints are not shipped yet. Planned surface: lane CRUD and whitelist
-enrollment behind `lanes:manage` / `lanes:view`, barrier destinations validated with
-the same SSRF guard as alert routes, and every whitelist row stored as a `plate_hash`
-HMAC token — the identical token `GET /api/search/plates` matches — so enrollment and
-sighting share one index and plaintext plates never reach the DB. Until the endpoints
-ship, `lane_access` stays off by default and nothing can trigger a barrier.
+Arm a camera as an access-control lane: its ANPR reads are matched against a
+whitelist of keyed-HMAC plate tokens inside an allow window, and a granted read
+dispatches a barrier OPEN to a webhook/MQTT relay. **Deny by default** — an
+unmatched plate is logged as a `gate_deny` event and never touches the barrier.
+Everything is off unless `pipeline_flags.lane_access` is set, which the arming
+endpoint does for you.
+
+```bash
+# Arm the lane (idempotent per camera; lanes:manage).
+curl -X PUT http://localhost:8000/api/cameras/$CAM/lane \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"name": "front gate", "barrier_channel": "mqtt",
+       "barrier_config": {"host": "broker.lan", "port": 1883, "topic": "gate/open"},
+       "allow_window": {"start": "07:00", "end": "19:00", "days": [1,2,3,4,5]},
+       "cooldown_sec": 30}'
+# => {"id": "...", "barrier_configured": true, "enabled": true, ...}
+
+# Enroll a plate — stored ONLY as the master-key HMAC token the OCR pipeline
+# writes to Event.detail.plate_hash, so enrollment and sighting share one index.
+curl -X POST http://localhost:8000/api/cameras/$CAM/lane/whitelist \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"plate": "AB12CD", "label": "delivery van"}'
+# => {"id": "...", "plate_hash": "…", "query": {"plate": "AB12CD"}}
+```
+
+The barrier destination passes the **same SSRF gate as alert routes**
+(`_validate_route_destination`) before persist — loopback is refused unless the
+operator allowlists it — and relay credentials are envelope-encrypted in
+`barrier_config_enc` and never returned (only `barrier_configured` is). Reads
+need `lanes:view`. `DELETE /api/cameras/{id}/lane` disarms and removes the
+policy + whitelist; `DELETE /api/lanes/whitelist/{entry_id}` revokes one plate.
+Every mutation is audit-logged with the plate **hash**, never the plaintext.
 
 ### Use case: Save a forensic search for the team shift (audited)
 ```bash
