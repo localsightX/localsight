@@ -754,6 +754,29 @@ body.wall-mode .live-tile-bar { position: absolute; bottom: 0; left: 0; right: 0
 .kv-grid dt { color: var(--text-tertiary); font-size: var(--text-sm); }
 .kv-grid dd { margin: 0; font-size: var(--text-sm); }
 
+/* ── Lane editor (R4.1 gate access) ─────────────────────────────────── */
+/* Text-tone helpers for inline status words (one color per meaning — see
+   .muted; these are the warn/bad counterparts the lane summary needs). */
+.tone-warn { color: var(--status-warn-text); }
+.tone-bad  { color: var(--status-crit-text); }
+/* Inline form error — the SSRF / window-validator message lands here, so it
+   must read as an error, not as body text. */
+.form-error { color: var(--status-crit-text); font-size: var(--text-sm); }
+.form-error:empty { display: none; } /* no error, no stray gap */
+/* Weekday chips for the allow window: all off = every day (permissive). */
+.lane-days { display: flex; flex-wrap: wrap; gap: var(--sp-1); margin-top: var(--sp-1); }
+.lane-day {
+  min-height: var(--control-h-sm); padding: 0 var(--sp-3);
+  border: 1px solid var(--border-2); border-radius: 999px;
+  background: var(--surface-1); color: var(--text-secondary);
+  font: inherit; font-size: var(--text-xs); cursor: pointer;
+}
+.lane-day:hover { border-color: var(--accent); color: var(--text-primary); }
+.lane-day.on {
+  border-color: var(--accent); color: var(--accent-text);
+  background: var(--accent-soft);
+}
+
 /* ═══ WAVE 4 — ANALYTICS & POLISH ═════════════════════════════════════ */
 
 /* Analytics layout: controls row + responsive widget grid */

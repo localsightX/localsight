@@ -27,6 +27,7 @@ alerts, and configuring privacy controls.
    - [The rules editor](#the-rules-editor)
    - [Behavior rules](#behavior-rules)
    - [Per-camera retention](#per-camera-retention)
+   - [Gate access lanes (R4.1)](#gate-access-lanes-r41)
    - [Removing a camera](#removing-a-camera)
 4. [Live view](#live-view)
 5. [Overview (the NOC screen)](#overview-the-noc-screen)
@@ -298,6 +299,47 @@ means unlimited — the default, so an upgrade changes nothing until you set one
 `{"days": 30}`) to override global policy for that camera's data. Global
 defaults: recordings 7 days, events 30 days, snapshots 14 days, embeddings
 90 days, audit 365 days.
+
+### Gate access lanes (R4.1)
+
+![The Gate access tab: lane status, the policy form, and the plate whitelist.](img/gate-access.png)
+
+A camera that watches a vehicle gate can be armed as an **access lane**: every
+plate its ANPR stage reads is matched against a whitelist, checked against an
+allow window, and — only on a match — fires one **OPEN** command at a barrier
+controller (a webhook or an MQTT broker). It is deny-by-default: a plate that
+isn't whitelisted, or is outside its window, is recorded as a `gate_deny` event
+and **never** reaches the relay. Arming needs the `lanes:manage` permission
+(ADMIN, SECURITY_OPERATOR); ANALYSTS see the tab read-only.
+
+Find it on the camera's detail page under **Gate access**:
+
+- **Lane status** — armed or disarmed, the barrier channel, whether a
+  destination is configured, the allow window, the cooldown, and how many
+  plates are whitelisted. The barrier destination is shown only as
+  "configured" — it is stored encrypted and never displayed back, exactly like
+  a stream URL.
+- **The policy form** — name, the per-plate cooldown (how long before the same
+  plate can open again), an optional **allow window** (start/end times, an
+  IANA timezone, and weekday chips — leave every chip off for 24/7), the
+  barrier channel, and its destination. A lane that is **Armed** must have a
+  destination: the editor refuses to save otherwise, because a lane with
+  nowhere to send the command can never open and would fail silently.
+- **Whitelisted plates** — enroll a plate with an optional note. The note is a
+  note — it must not *be* the plate. Only the plate's keyed digest is stored;
+  the digest is the same token the ANPR pipeline writes to each gate event,
+  so a whitelist row and an event row line up by construction. **Revoke** takes
+  effect on the next plate read (the worker joins the whitelist per read).
+- **Remove this lane** — disarms the camera and deletes the policy and the
+  whole whitelist. Gate events already recorded stay in the audit trail.
+
+**What the barrier command carries:** camera name, lane name, event time, the
+plate *digest* (never the plate text), and a snapshot link when one exists —
+the same third-party-safe shape as an alert. Relay credentials are
+envelope-encrypted at rest, and the destination is checked against the
+deployment's egress allowlist *before* it is saved, so a lane can never be
+aimed at an internal address the operator didn't authorize. Every arm, disarm,
+open and deny is audit-logged.
 
 ### Removing a camera
 
@@ -651,6 +693,7 @@ The Privacy view is the resident-audit surface, four cards:
 | Enrollment embeddings | Envelope-encrypted | Never returned |
 | Snapshots / recordings | Storage keys encrypted; objects served via short-lived signed URLs | Signed URL (≤ `expires_sec`) |
 | Alert route secrets | Encrypted at rest | Never returned |
+| Barrier relay credentials (R4.1 lanes) | Encrypted at rest (`barrier_config_enc`) | Never returned — only a "configured" boolean |
 | Passwords | Argon2id hashes | n/a |
 | Audit log | Append-only rows (retention-bounded) | `audit:view` permission |
 

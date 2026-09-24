@@ -199,11 +199,18 @@ def test_dashboard_summary_counts_today_only(client, admin_auth):
             s.add(cam)
             s.flush()
         now = datetime.now(dt.UTC)
-        for i, delta in enumerate((timedelta(minutes=-30), timedelta(hours=-30))):
+        # The dashboard buckets "today" as [UTC midnight, ∞) with NO upper
+        # bound, so the recent event only needs to share today's date. A fixed
+        # -30m offset lands on yesterday when the suite runs inside the
+        # 00:00-00:30 UTC window (it went flaky on CI at exactly that time:
+        # events_today.total == 0 instead of 1). Noon today is inside the day
+        # for every instant of it, so the bucket is date-stable.
+        recent = datetime.combine(now.date(), dt.time(12, 0), tzinfo=dt.UTC)
+        for i, ts in enumerate((recent, now - timedelta(hours=30))):
             s.add(EventModel(
                 id=f"ev-sum-{i}", camera_id=cam.id,
                 event_type="presence", identity_status="unknown",
-                timestamp_start=now + delta, timestamp_end=now + delta + timedelta(seconds=30),
+                timestamp_start=ts, timestamp_end=ts + timedelta(seconds=30),
                 bbox={"x": 0, "y": 0, "w": 0.1, "h": 0.1}, confidence=0.5,
             ))
         s.commit()
