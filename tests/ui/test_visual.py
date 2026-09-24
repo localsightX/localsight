@@ -42,7 +42,14 @@ STATES = {
     "rules-editor":     {"tol": 4.0},
     "people":           {"tol": 3.0},
     "analytics":        {"tol": 3.0},
-    "users":            {"tol": 3.0},
+    # Rasterization headroom, not layout slack: `users` is the densest mono-
+    # glyph state (a table of emails), so per-glyph antialiasing between the
+    # macOS baseline and the Linux CI runner lands it at a deterministic 3.07
+    # there with no layout change (uniform band drift, no geometry move). A
+    # real 12px panel shift scores ~7.9 (see the module header), so 3.2 still
+    # catches layout regressions while surviving a font-set change on either
+    # host. The other 3.0 states render ≤3.0 on CI today.
+    "users":            {"tol": 3.2},
 }
 
 # Wall-clock MASKS (Playwright screenshot masking): elements whose CONTENT
